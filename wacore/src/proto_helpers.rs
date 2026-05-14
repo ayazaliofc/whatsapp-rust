@@ -2,12 +2,10 @@ use std::str::FromStr;
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
-/// Invokes a callback macro with the list of all message types that have `context_info`.
-///
-/// This macro ensures both `for_each_context_info_message!` and `set_context_info_on_message!`
-/// use the same list of message types, making it easy to add new types in one place.
-///
-/// When WhatsApp adds new message types with context_info, add them here.
+/// Single source of truth for the message types that carry a `context_info`
+/// field. Consumed by `for_each_context_info_message!`, `set_context_info`
+/// (via an inlined `try_attach!`), `get_ephemeral_expiration`, and
+/// `set_ephemeral_expiration`. Add new WA message types with context_info here.
 macro_rules! with_context_info_fields {
     ($callback:ident!($($prefix:tt)*)) => {
         $callback!($($prefix)*
@@ -64,27 +62,6 @@ macro_rules! for_each_context_info_impl {
             }
         )+
     };
-}
-
-/// Sets context_info on the first matching message type.
-/// Returns true if context was set, false otherwise.
-macro_rules! set_context_info_on_message {
-    ($msg:expr, $ctx:expr) => {
-        with_context_info_fields!(set_context_info_impl!($msg, $ctx,))
-    };
-}
-
-macro_rules! set_context_info_impl {
-    ($msg:expr, $ctx:expr, $($field:ident),+ $(,)?) => {{
-        let ctx = $ctx;
-        $(
-            if let Some(ref mut m) = $msg.$field {
-                m.context_info = Some(ctx);
-                return true;
-            }
-        )+
-        false
-    }};
 }
 
 /// Extension trait for wa::Message
@@ -153,9 +130,11 @@ pub trait MessageExt {
     /// Reads `context_info.expiration` from the first message type that has it.
     fn get_ephemeral_expiration(&self) -> Option<u32>;
 
-    /// Sets `context_info.expiration` on the first message type found.
-    /// Creates a default `context_info` if needed. Returns `false` for
-    /// bare `conversation` messages (use `ExtendedTextMessage` instead).
+    /// Sets `context_info.expiration` on the first message type found, creating
+    /// a default `context_info` if needed. A bare `conversation` body is
+    /// promoted to `extended_text_message { text, context_info { expiration } }`
+    /// (mirrors `WAWebMessageSendUtils`). Returns `true` on success or
+    /// promotion, `false` only when no body can carry the timer.
     fn set_ephemeral_expiration(&mut self, expiration: u32) -> bool;
 }
 
@@ -315,7 +294,29 @@ impl MessageExt for wa::Message {
     }
 
     fn set_context_info(&mut self, context: wa::ContextInfo) -> bool {
-        set_context_info_on_message!(self, Box::new(context))
+        macro_rules! try_attach {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(ref mut m) = self.$field {
+                        m.context_info = Some(Box::new(context));
+                        return true;
+                    }
+                )+
+            };
+        }
+        with_context_info_fields!(try_attach!());
+
+        // Promote bare conversation to extended_text_message so the context
+        // can attach; matches WAWebMessageSendUtils.
+        if let Some(text) = self.conversation.take() {
+            self.extended_text_message = Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some(text),
+                context_info: Some(Box::new(context)),
+                ..Default::default()
+            }));
+            return true;
+        }
+        false
     }
 
     fn get_ephemeral_expiration(&self) -> Option<u32> {
@@ -354,6 +355,21 @@ impl MessageExt for wa::Message {
             };
         }
         with_context_info_fields!(try_set!());
+
+        // Promote bare conversation so the timer can attach; matches
+        // WAWebMessageSendUtils.
+        if let Some(text) = self.conversation.take() {
+            self.extended_text_message = Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some(text),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    expiration: Some(expiration),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }));
+            return true;
+        }
+
         false
     }
 }
@@ -897,9 +913,8 @@ mod tests {
         assert!(loc.context_info.is_some());
     }
 
-    /// Test: set_context_info returns false for unsupported message types
     #[test]
-    fn test_set_context_info_unsupported() {
+    fn test_set_context_info_promotes_bare_conversation() {
         let mut msg = wa::Message {
             conversation: Some("Simple text".to_string()),
             ..Default::default()
@@ -910,7 +925,30 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(msg.set_context_info(context));
+        assert!(msg.conversation.is_none(), "conversation must be moved out");
+        let ext = msg
+            .extended_text_message
+            .expect("promoted to extended_text_message");
+        assert_eq!(ext.text.as_deref(), Some("Simple text"));
+        assert_eq!(
+            ext.context_info
+                .as_ref()
+                .and_then(|c| c.stanza_id.as_deref()),
+            Some("test-id")
+        );
+    }
+
+    #[test]
+    fn test_set_context_info_returns_false_on_empty_message() {
+        let mut msg = wa::Message::default();
+        let context = wa::ContextInfo {
+            stanza_id: Some("test-id".to_string()),
+            ..Default::default()
+        };
         assert!(!msg.set_context_info(context));
+        assert!(msg.conversation.is_none());
+        assert!(msg.extended_text_message.is_none());
     }
 
     /// Test: build_quote_context produces correct structure.
@@ -1824,6 +1862,30 @@ mod tests {
             ..Default::default()
         };
         assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn set_ephemeral_expiration_promotes_bare_conversation_to_extended_text() {
+        let mut msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        assert!(msg.set_ephemeral_expiration(86400));
+        assert!(msg.conversation.is_none());
+        let ext = msg.extended_text_message.unwrap();
+        assert_eq!(ext.text.as_deref(), Some("hello"));
+        assert_eq!(
+            ext.context_info.as_ref().and_then(|c| c.expiration),
+            Some(86400)
+        );
+    }
+
+    #[test]
+    fn set_ephemeral_expiration_returns_false_on_empty_message() {
+        let mut msg = wa::Message::default();
+        assert!(!msg.set_ephemeral_expiration(60));
+        assert!(msg.conversation.is_none());
+        assert!(msg.extended_text_message.is_none());
     }
 
     #[test]

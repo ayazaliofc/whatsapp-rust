@@ -527,6 +527,19 @@ impl Client {
         self.shutdown_notifier.subscribe()
     }
 
+    /// Synchronous flag-only equivalent of the first lines of `disconnect()`.
+    /// Spawned tasks watching `is_shutting_down()` / `shutdown_notifier` exit
+    /// on their next poll. Does NOT flush, close the transport, or touch
+    /// persistence — prefer `disconnect()` whenever you can `await`. Exists
+    /// for `Drop` impls on FFI wrappers (e.g. `WasmWhatsAppClient`) that
+    /// can't run async cleanup synchronously.
+    pub fn signal_shutdown_sync(&self) {
+        self.expected_disconnect.store(true, Ordering::Relaxed);
+        self.is_running.store(false, Ordering::Relaxed);
+        self.shutdown_notifier.notify();
+        self.notify_connection_shutdown();
+    }
+
     pub(crate) fn connection_shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.connection_shutdown
             .lock()
@@ -1829,12 +1842,26 @@ impl Client {
     }
 
     /// Determine if a node should be acknowledged with <ack/>.
+    ///
+    /// Newsletter messages need `<ack class="message">` (per
+    /// `OutMessageDeliverCommonAckMixin`); regular DM/group send a
+    /// `<receipt>` instead. Status broadcasts also need the ack until
+    /// `send_delivery_receipt` stops skipping them.
     fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        matches!(
-            node.tag.as_ref(),
-            "message" | "receipt" | "notification" | "call"
-        ) && node.get_attr("id").is_some()
-            && node.get_attr("from").is_some()
+        let tag = node.tag.as_ref();
+        if node.get_attr("id").is_none() {
+            return false;
+        }
+        let Some(from) = node.get_attr("from") else {
+            return false;
+        };
+        match tag {
+            "receipt" | "notification" | "call" => true,
+            "message" => from
+                .to_jid()
+                .is_some_and(|j| j.is_newsletter() || j.is_status_broadcast()),
+            _ => false,
+        }
     }
 
     /// Possibly send a deferred ack: either immediately or via spawned task.
@@ -3833,7 +3860,13 @@ fn encode_ack_bytes(
     let Some(from_val) = node.get_attr("from") else {
         return Ok(None);
     };
-    let participant_val = node.get_attr("participant");
+    // WAWebReceiptAck: `participant: r && r !== e ? DEVICE_JID(r) : DROP_ATTR`.
+    // Drop the attribute when it would duplicate `to` (which is the flipped `from`).
+    let participant_val = node.get_attr("participant").filter(|p| {
+        let p_str = p.as_str();
+        let from_str = from_val.as_str();
+        p_str.as_ref() != from_str.as_ref()
+    });
     let tag = node.tag.as_ref();
 
     let typ_val = if tag != "message" && !is_encrypt_identity_notification(node) {
@@ -3922,8 +3955,13 @@ fn encode_ack_bytes(
 #[cfg(test)]
 fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>) -> Option<Node> {
     let id = node.get_attr("id")?.to_node_value();
-    let from = node.get_attr("from")?.to_node_value();
-    let participant = node.get_attr("participant").map(|v| v.to_node_value());
+    let from_ref = node.get_attr("from")?;
+    let from = from_ref.to_node_value();
+    // Drop participant when it duplicates `to` (the flipped `from`).
+    let participant = node
+        .get_attr("participant")
+        .filter(|p| p.as_str().as_ref() != from_ref.as_str().as_ref())
+        .map(|v| v.to_node_value());
     let tag = node.tag.as_ref();
     let typ = if tag != "message" && !is_encrypt_identity_notification(node) {
         node.get_attr("type").map(|v| v.to_node_value())
@@ -4045,6 +4083,53 @@ mod tests {
         assert!(
             client.should_ack(&notification_node.as_node_ref()),
             "should_ack must still return TRUE for <notification> stanzas."
+        );
+
+        // Regular <message> stanzas (DM / group) are acked via the delivery
+        // <receipt>, not a bare <ack class="message">. WA Web only emits
+        // <ack class="message"> for newsletter deliveries.
+        let mut dm_attrs = Attrs::new();
+        dm_attrs.insert(
+            "from".to_string(),
+            "5511999999999@s.whatsapp.net".to_string(),
+        );
+        dm_attrs.insert("id".to_string(), "MSG-DM-1".to_string());
+        let dm_message = Node::new("message", dm_attrs, None);
+        assert!(
+            !client.should_ack(&dm_message.as_node_ref()),
+            "should_ack must return FALSE for regular DM <message> (delivery receipt covers it)."
+        );
+
+        let mut group_attrs = Attrs::new();
+        group_attrs.insert("from".to_string(), "120363098765432100@g.us".to_string());
+        group_attrs.insert("id".to_string(), "MSG-GROUP-1".to_string());
+        let group_message = Node::new("message", group_attrs, None);
+        assert!(
+            !client.should_ack(&group_message.as_node_ref()),
+            "should_ack must return FALSE for group <message>."
+        );
+
+        let mut newsletter_attrs = Attrs::new();
+        newsletter_attrs.insert(
+            "from".to_string(),
+            "120363298765432100@newsletter".to_string(),
+        );
+        newsletter_attrs.insert("id".to_string(), "MSG-NL-1".to_string());
+        let newsletter_message = Node::new("message", newsletter_attrs, None);
+        assert!(
+            client.should_ack(&newsletter_message.as_node_ref()),
+            "should_ack must return TRUE for newsletter <message>."
+        );
+
+        // send_delivery_receipt skips status@broadcast, so the ack stays
+        // as the server-level acknowledgement until receipts cover it.
+        let mut status_attrs = Attrs::new();
+        status_attrs.insert("from".to_string(), "status@broadcast".to_string());
+        status_attrs.insert("id".to_string(), "MSG-STATUS-1".to_string());
+        let status_message = Node::new("message", status_attrs, None);
+        assert!(
+            client.should_ack(&status_message.as_node_ref()),
+            "should_ack must return TRUE for status@broadcast <message> until receipts cover it."
         );
 
         info!(
@@ -5670,6 +5755,47 @@ mod tests {
         assert!(
             !ack.attrs.contains_key("from"),
             "receipt ACKs should not include our device PN"
+        );
+    }
+
+    #[test]
+    fn test_build_ack_node_drops_participant_when_equal_to_from() {
+        // WAWebReceiptAck: `participant: r && r !== e ? DEVICE_JID(r) : DROP_ATTR`.
+        // When the incoming stanza carries participant == from (redundant),
+        // the ack must not echo it.
+        let incoming = NodeBuilder::new("receipt")
+            .attr("from", "156535032389744@lid")
+            .attr("participant", "156535032389744@lid")
+            .attr("id", "RCPT-PARTICIPANT-EQ-FROM")
+            .build();
+        let own_device_pn: Jid = "155500012345:48@s.whatsapp.net".parse().unwrap();
+
+        let ack = build_ack_node(&incoming.as_node_ref(), Some(&own_device_pn))
+            .expect("ack should build");
+        assert!(
+            !ack.attrs.contains_key("participant"),
+            "ack must drop participant when it duplicates `to` (the flipped from); got {:?}",
+            ack.attrs.get("participant")
+        );
+    }
+
+    #[test]
+    fn test_build_ack_node_keeps_participant_when_distinct_from_from() {
+        // Group receipt: participant = sender (user), from = group jid; must be kept.
+        let incoming = NodeBuilder::new("receipt")
+            .attr("from", "120363098765432100@g.us")
+            .attr("participant", "5511999999999@s.whatsapp.net")
+            .attr("id", "RCPT-GROUP")
+            .build();
+        let own_device_pn: Jid = "155500012345:48@s.whatsapp.net".parse().unwrap();
+
+        let ack = build_ack_node(&incoming.as_node_ref(), Some(&own_device_pn))
+            .expect("ack should build");
+        assert!(
+            ack.attrs
+                .get("participant")
+                .is_some_and(|v| v == "5511999999999@s.whatsapp.net"),
+            "ack must keep participant when it differs from `to`"
         );
     }
 
