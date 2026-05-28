@@ -64,6 +64,28 @@ macro_rules! for_each_context_info_impl {
     };
 }
 
+/// Returns `Some(ctx)` for the first message variant carrying a `ContextInfo`,
+/// short-circuiting on match (`break 'find`). Read-only variant of
+/// [`for_each_context_info_message!`].
+macro_rules! find_context_info_ref {
+    ($msg:expr) => {{ with_context_info_fields!(find_context_info_impl!($msg,)) }};
+}
+
+macro_rules! find_context_info_impl {
+    ($msg:expr, $($field:ident),+ $(,)?) => {{
+        let mut found: Option<&wa::ContextInfo> = None;
+        $(
+            if found.is_none()
+                && let Some(ref m) = $msg.$field
+                && let Some(ref ctx) = m.context_info
+            {
+                found = Some(ctx);
+            }
+        )+
+        found
+    }};
+}
+
 /// Extension trait for wa::Message
 pub trait MessageExt {
     /// Recursively unwraps ephemeral/view-once/document_with_caption/edited wrappers to get the core message.
@@ -136,6 +158,18 @@ pub trait MessageExt {
     /// (mirrors `WAWebMessageSendUtils`). Returns `true` on success or
     /// promotion, `false` only when no body can carry the timer.
     fn set_ephemeral_expiration(&mut self, expiration: u32) -> bool;
+
+    /// `context_info.is_forwarded == Some(true)` on the first base message
+    /// that carries a context_info. Mirrors WA Web's `x.isForwarded`
+    /// guard in `processRenderableMessages` (which skips caching
+    /// `messageSecret` for forwarded payloads).
+    fn is_forwarded(&self) -> bool;
+
+    /// `true` if `context_info.mentioned_jid` on any base message contains
+    /// a JID whose user-form ends with `@bot`. Mirrors WA Web's
+    /// `mentionedJidList.find(jid.isBot())` lookup used to derive
+    /// `invokedBotWid` when `messageSecret` is present.
+    fn mentions_any_bot(&self) -> bool;
 }
 
 impl MessageExt for wa::Message {
@@ -371,6 +405,28 @@ impl MessageExt for wa::Message {
         }
 
         false
+    }
+
+    fn is_forwarded(&self) -> bool {
+        let base = self.get_base_message();
+        find_context_info_ref!(base)
+            .and_then(|ctx| ctx.is_forwarded)
+            .unwrap_or(false)
+    }
+
+    fn mentions_any_bot(&self) -> bool {
+        let base = self.get_base_message();
+        let Some(ctx) = find_context_info_ref!(base) else {
+            return false;
+        };
+        // Use the canonical `Jid::is_bot()` contract — it covers both the
+        // `@bot` server and the legacy PN-form Meta bot (e.g. `1313555…`),
+        // matching WA Web's `jid.isBot()`. The list is short and this only
+        // runs on the group-mention path (chat isn't already a bot).
+        ctx.mentioned_jid
+            .iter()
+            .filter_map(|s| Jid::from_str(s).ok())
+            .any(|jid| jid.is_bot())
     }
 }
 
@@ -1908,5 +1964,128 @@ mod tests {
             ..Default::default()
         };
         assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn mentions_any_bot_true_for_bot_jid_in_extended_text() {
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("@MetaAI hi".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec![
+                        "5511999998888@s.whatsapp.net".into(),
+                        "867051314767696@bot".into(),
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_true_for_legacy_pn_form_bot() {
+        // `Jid::is_bot()` also matches the legacy PN-form Meta bot; the old
+        // `@bot`-only string split would have missed this.
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("@MetaAI".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec!["13135550002@s.whatsapp.net".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_false_without_bot_jid() {
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("hi friends".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec![
+                        "5511999998888@s.whatsapp.net".into(),
+                        "120363021033254949@g.us".into(),
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(!msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_false_for_no_context_info() {
+        let msg = wa::Message {
+            conversation: Some("plain".into()),
+            ..Default::default()
+        };
+        assert!(!msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_sees_through_device_sent_wrapper() {
+        let msg = wa::Message {
+            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                destination_jid: Some("867051314767696@bot".into()),
+                message: Some(Box::new(wa::Message {
+                    extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                        text: Some("@MetaAI".into()),
+                        context_info: Some(Box::new(wa::ContextInfo {
+                            mentioned_jid: vec!["867051314767696@bot".into()],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(
+            msg.mentions_any_bot(),
+            "must unwrap DeviceSentMessage before reading context_info"
+        );
+    }
+
+    #[test]
+    fn is_forwarded_true_and_false() {
+        let fwd = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("fwd".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(fwd.is_forwarded());
+
+        let plain = wa::Message {
+            conversation: Some("plain".into()),
+            ..Default::default()
+        };
+        assert!(!plain.is_forwarded());
+
+        let not_fwd = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("hi".into()),
+                context_info: Some(Box::new(wa::ContextInfo::default())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(!not_fwd.is_forwarded());
     }
 }

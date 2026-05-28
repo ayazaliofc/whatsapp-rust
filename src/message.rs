@@ -65,6 +65,7 @@ pub(crate) struct ClassifiedMessage {
     pub sender_encryption_jid: Jid,
     pub session_payloads: Vec<EncPayload>,
     pub group_payloads: Vec<EncPayload>,
+    pub bot_payloads: Vec<EncPayload>,
     pub max_sender_retry_count: u8,
     pub decrypt_fail_mode: crate::types::events::DecryptFailMode,
 }
@@ -87,7 +88,7 @@ pub(crate) use wacore::protocol::retry::RetryReason;
 
 impl Client {
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
-    fn dispatch_parsed_message(self: &Arc<Self>, msg: wa::Message, info: &Arc<MessageInfo>) {
+    async fn dispatch_parsed_message(self: &Arc<Self>, msg: wa::Message, info: &Arc<MessageInfo>) {
         use wacore::proto_helpers::MessageExt;
 
         let mut info = Arc::clone(info);
@@ -98,6 +99,11 @@ impl Client {
                 msg.get_base_message().get_ephemeral_expiration();
         }
 
+        // Awaited (not spawned) so the messageSecret is durably stored before
+        // this chat's worker dequeues the next stanza. A bot reply queued right
+        // behind its own fanout (offline replay) would otherwise race the write
+        // and hit MissingMessageSecret.
+        self.maybe_capture_inbound_msg_secret(&msg, &info).await;
         self.ack_received_message(&info);
 
         self.core
@@ -114,6 +120,16 @@ impl Client {
         if info.id.is_empty() || info.source.chat.is_newsletter() {
             return;
         }
+        // WA Web `sendAggregateReceipts`: for a DELIVERY where the chat is NOT
+        // a bot but the author IS a bot (a bot reply inside a group), it emits
+        // a bare `<ack class="message">` via `sendBotInvokeResponseAcks`, not a
+        // `<receipt>`. A 1:1 bot chat keeps the normal receipt (chat.isBot() →
+        // the branch's `v` is false). Our transport ack is that bare
+        // `<ack class="message">` (group form carries `participant`).
+        if info.source.chat.server != wacore_binary::Server::Bot && info.source.sender.is_bot() {
+            self.spawn_message_ack(info);
+            return;
+        }
         if Self::should_send_delivery_receipt(info) {
             self.spawn_delivery_receipt(info);
         } else if !info.source.chat.is_status_broadcast() {
@@ -128,6 +144,335 @@ impl Client {
         self.outbound_flush.spawn(&*self.runtime, async move {
             client.send_delivery_receipt(&info).await;
         });
+    }
+
+    /// Capture an embedded `MessageContextInfo.message_secret` from any
+    /// bot-targeted message (fanout from us OR reply from the bot) so a
+    /// future `<enc type="msmsg">` referencing this id can decrypt.
+    /// Mirrors WA Web `processRenderableMessages`:
+    /// `$ && (P || N || w || A) && !isForwarded → addMsmsgMsgSecretToCache`.
+    pub(crate) async fn maybe_capture_inbound_msg_secret(
+        self: &Arc<Self>,
+        msg: &wa::Message,
+        info: &Arc<MessageInfo>,
+    ) {
+        use wacore::proto_helpers::MessageExt;
+        const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
+
+        let mci = msg.message_context_info.as_ref();
+        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
+        let mentions_bot = msg.mentions_any_bot();
+        // `MessageContextInfo.bot_metadata` is the bot-invocation envelope WA
+        // Web reads; it's present on bot prompts (incl. our own group prompt)
+        // even when no JID is mentioned, covering WA Web's `w`/`A` gates.
+        let has_bot_metadata = mci.is_some_and(|m| m.bot_metadata.is_some());
+
+        let Some(secret_bytes) = mci.and_then(|m| m.message_secret.as_deref()) else {
+            return;
+        };
+        let Ok(secret_arr) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
+            return;
+        };
+        // WA Web `processRenderableMessages`: `$ && (P || N || w || A) && !fwd`.
+        // P=chat is bot, N=mentions a bot, w/A=bot group participant (we proxy
+        // those via bot_metadata presence, the bot-invocation envelope).
+        if !chat_is_bot && !mentions_bot && !has_bot_metadata {
+            return;
+        }
+        if msg.is_forwarded() {
+            return;
+        }
+        // Key the secret under the identity the bot reply will echo in
+        // `<meta target_sender_jid>` at GET time:
+        //  * bot DM: `info.source.sender` is our PN device JID, but the reply
+        //    echoes our LID — resolve via dm_sender_identity_for.
+        //  * group / regular: `info.source.sender` is already the author's
+        //    addressing identity (our LID in a LID group, the other
+        //    participant's JID for their prompt) — exactly what the reply
+        //    echoes. Use it directly.
+        // alternate_msg_secret_lookup still bridges any residual LID↔PN skew.
+        let sender = if chat_is_bot {
+            match self.dm_sender_identity_for(&info.source.chat).await {
+                Some(j) => j,
+                None => return,
+            }
+        } else {
+            info.source.sender.clone()
+        };
+        log::debug!(
+            "[msg:{}] cached bot messageSecret under sender={}",
+            info.id,
+            sender.to_non_ad_string()
+        );
+        self.persist_outbound_msg_secret(&info.source.chat, &sender, &info.id, secret_arr)
+            .await;
+    }
+
+    /// Decrypt and dispatch a `<enc type="msmsg">` bot reply. Looks up the
+    /// outbound `messageSecret` we persisted at send time and runs the
+    /// dual-HKDF + AES-GCM open from [`wacore::bot_message`]. Failures
+    /// (missing secret, GCM tag fail, malformed proto) nack with code 495.
+    pub(crate) async fn handle_msmsg_payload(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        payload: EncPayload,
+    ) {
+        use prost::Message as _;
+        use wa::MessageSecretMessage;
+        use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
+        use wacore::protocol::nack::NackReason;
+
+        let ms_msg = match MessageSecretMessage::decode(&*payload.ciphertext) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] failed to decode MessageSecretMessage: {e:?}",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::ParsingError, None);
+                return;
+            }
+        };
+        let (Some(enc_iv), Some(enc_payload)) =
+            (ms_msg.enc_iv.as_deref(), ms_msg.enc_payload.as_deref())
+        else {
+            log::warn!(
+                "[msg:{}] MessageSecretMessage missing enc_iv/enc_payload",
+                info.id
+            );
+            self.spawn_nack(info, NackReason::ParsingError, None);
+            return;
+        };
+
+        // Target sender (us): meta echoes our LID/PN. Falls back to our LID
+        // when sender is on the bot server, our PN otherwise (whatsmeow
+        // `decryptBotMessage`).
+        let target_sender = match self.resolve_msmsg_target_sender(info).await {
+            Some(j) => j,
+            None => {
+                log::warn!("[msg:{}] msmsg: no target_sender resolvable", info.id);
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+        };
+
+        // Chat scope for the secret lookup: prefer <meta target_chat_jid>;
+        // fall back to the stanza's chat (matches WA Web `decryptMsmsgBotMessage`).
+        let chat_for_lookup = info
+            .meta_info
+            .target_chat
+            .as_ref()
+            .unwrap_or(&info.source.chat)
+            .to_non_ad()
+            .to_string();
+        let target_sender_str = target_sender.to_non_ad_string();
+
+        // The id used for the SECRET LOOKUP is `meta.target_id` (our outbound
+        // id); the id used as HKDF input is the bot reply id (or
+        // `bot_info.edit_target_id` when the bot is editing a prior reply).
+        let target_id = match info.meta_info.target_id.as_deref() {
+            Some(id) => id,
+            None => {
+                log::warn!(
+                    "[msg:{}] msmsg: <meta> missing target_id; cannot look up secret",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+        };
+
+        // Mirror WA Web `C()` in `WAWebBotMessageSecret.js`: primary lookup
+        // plus an alternate (PN ↔ LID swap via lid_pn_mapping) so a row
+        // stored under one identity family is still found if `<meta
+        // target_sender_jid>` echoes the other. Covers LID migration windows
+        // and asymmetric outbound/inbound identities.
+        let backend = self.persistence_manager.backend();
+        let primary = backend
+            .get_msg_secret(&chat_for_lookup, &target_sender_str, target_id)
+            .await;
+        let secret = match primary {
+            Ok(Some(s)) => s,
+            Ok(None) => match self
+                .alternate_msg_secret_lookup(&backend, &chat_for_lookup, &target_sender, target_id)
+                .await
+            {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    // For a group bot invocation initiated by our PRIMARY
+                    // device, the messageSecret lives in the bot-addressed copy
+                    // the primary sent directly to the bot — it is NOT mirrored
+                    // to companions in the group skmsg. So a companion
+                    // legitimately never holds the secret; this miss is expected
+                    // and benign (we nack 495 and the server stops replaying).
+                    // A miss in a 1:1 bot chat is unexpected and worth a warn.
+                    log::log!(
+                        if info.source.is_group {
+                            log::Level::Debug
+                        } else {
+                            log::Level::Warn
+                        },
+                        "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
+                        info.id
+                    );
+                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    return;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] msmsg: alternate lookup failed: {e:?}; nack 495",
+                        info.id
+                    );
+                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    return;
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] backend error reading message_secret ({e:?}); nack 495 so the server stops replaying",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+        };
+
+        let bot_user_jid = info.source.sender.to_non_ad_string();
+        // WA Web `decryptMsmsgBotMessage` dispatches on `isFbidBot()`:
+        //   * fbid path pre-resolves to `edit_target_id` for INNER/LAST edits,
+        //     `externalId` (info.id) otherwise. Single AES-GCM attempt.
+        //   * regular path tries `externalId` first, falls back to
+        //     `edit_target_id` on AES-GCM failure.
+        // We don't have `isFbidBot()` detection; instead, we unify the two as
+        // try-then-fallback with the fbid-style id as primary. That's a strict
+        // superset: for INNER/LAST it usually succeeds on the first try (fbid
+        // outcome); for any other case primary is `info.id` so we mirror the
+        // regular path's first attempt. The fallback is only attempted if
+        // `bot_info.edit_target_id` is present.
+        let info_id = info.id.as_str();
+        let primary_msg_id = info
+            .bot_info
+            .as_ref()
+            .filter(|bi| {
+                matches!(
+                    bi.edit_type,
+                    Some(
+                        crate::types::message::BotEditType::Inner
+                            | crate::types::message::BotEditType::Last
+                    )
+                )
+            })
+            .and_then(|bi| bi.edit_target_id.as_deref())
+            .unwrap_or(info_id);
+        let fallback_msg_id = if primary_msg_id == info_id {
+            info.bot_info
+                .as_ref()
+                .and_then(|bi| bi.edit_target_id.as_deref())
+        } else {
+            Some(info_id)
+        }
+        .filter(|fb| *fb != primary_msg_id);
+
+        let attempt = |msg_id: &str| {
+            let ctx = BotMessageContext {
+                msg_id,
+                target_sender_user_jid: &target_sender_str,
+                bot_user_jid: &bot_user_jid,
+            };
+            decrypt_bot_message(&secret, enc_iv, enc_payload, &ctx)
+        };
+
+        let plaintext = match attempt(primary_msg_id) {
+            Ok(p) => p,
+            Err(primary_err) => match fallback_msg_id {
+                Some(fb) => match attempt(fb) {
+                    Ok(p) => p,
+                    Err(fallback_err) => {
+                        log::warn!(
+                            "[msg:{}] msmsg AES-GCM open failed both attempts (primary={primary_err:?}, fallback={fallback_err:?})",
+                            info.id
+                        );
+                        self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                        return;
+                    }
+                },
+                None => {
+                    log::warn!(
+                        "[msg:{}] msmsg AES-GCM open failed and no fallback msg_id: {primary_err:?}",
+                        info.id
+                    );
+                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    return;
+                }
+            },
+        };
+
+        let msg = match wa::Message::decode(plaintext.as_slice()) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] msmsg plaintext is not a Message proto: {e:?}",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::ParsingError, None);
+                return;
+            }
+        };
+
+        log::info!(
+            "[msg:{}] Successfully decrypted msmsg bot reply from {}",
+            info.id,
+            info.source.sender
+        );
+        self.dispatch_parsed_message(msg, info).await;
+    }
+
+    /// Resolve `target_sender` for a msmsg stanza: echo from `<meta>` when
+    /// present, else fall back to our LID (sender on bot server) or PN.
+    async fn resolve_msmsg_target_sender(&self, info: &Arc<MessageInfo>) -> Option<Jid> {
+        if let Some(ts) = info.meta_info.target_sender.as_ref() {
+            return Some(ts.clone());
+        }
+        if info.source.sender.server == wacore_binary::Server::Bot {
+            self.get_lid().await
+        } else {
+            self.get_pn().await
+        }
+    }
+
+    /// Second-chance lookup with the alternate identity family. Mirrors
+    /// `WAWebLidMigrationUtils.getAlternateMsgKey`: swap PN ↔ LID via the
+    /// `lid_pn_mapping` store and retry. Returns `Ok(None)` when no mapping
+    /// is known or the alternate row is absent — the caller treats that as
+    /// a terminal miss.
+    async fn alternate_msg_secret_lookup(
+        &self,
+        backend: &Arc<dyn crate::store::traits::Backend>,
+        chat_for_lookup: &str,
+        primary_sender: &Jid,
+        target_id: &str,
+    ) -> Result<Option<Vec<u8>>, crate::store::error::StoreError> {
+        let alternate_user = match primary_sender.server {
+            wacore_binary::Server::Lid => backend
+                .get_lid_mapping(&primary_sender.user)
+                .await?
+                .map(|m| (m.phone_number, wacore_binary::Server::Pn)),
+            wacore_binary::Server::Pn => backend
+                .get_pn_mapping(&primary_sender.user)
+                .await?
+                .map(|m| (m.lid, wacore_binary::Server::Lid)),
+            _ => None,
+        };
+        let Some((user, server)) = alternate_user else {
+            return Ok(None);
+        };
+        let mut alternate_str = String::with_capacity(user.len() + 1 + server.as_str().len());
+        alternate_str.push_str(&user);
+        alternate_str.push('@');
+        alternate_str.push_str(server.as_str());
+        backend
+            .get_msg_secret(chat_for_lookup, &alternate_str, target_id)
+            .await
     }
 
     /// Handles a newsletter plaintext message.
@@ -154,7 +499,7 @@ impl Client {
                         info.id,
                         info.source.chat
                     );
-                    self.dispatch_parsed_message(msg, info);
+                    self.dispatch_parsed_message(msg, info).await;
                 }
                 Err(e) => {
                     log::warn!(
@@ -502,6 +847,7 @@ impl Client {
 
         let mut session_payloads = Vec::with_capacity(all_enc_nodes.len());
         let mut group_payloads = Vec::with_capacity(all_enc_nodes.len());
+        let mut bot_payloads = Vec::with_capacity(all_enc_nodes.len());
         let mut max_sender_retry_count: u8 = 0;
         let mut has_hide_fail = false;
         let mut had_unknown_enc = false;
@@ -567,7 +913,7 @@ impl Client {
             }
 
             // `had_unknown_enc` means "produced no usable payload": either the
-            // type is unrecognized (msmsg) or it's known but the body is empty.
+            // type is unrecognized or it's known but the body is empty.
             // Either way the stanza needs the fallback ack or the server replays.
             if EncType::from_wire(enc_type.as_ref()).is_none() {
                 log::warn!("Enc node has unknown type: {enc_type}");
@@ -584,7 +930,9 @@ impl Client {
                 }
             };
 
-            if payload.enc_type.is_session() {
+            if payload.enc_type.is_bot_secret() {
+                bot_payloads.push(payload);
+            } else if payload.enc_type.is_session() {
                 session_payloads.push(payload);
             } else {
                 group_payloads.push(payload);
@@ -608,12 +956,14 @@ impl Client {
             );
         }
 
-        // Unknown-only stanzas (e.g. msmsg from the Meta AI bot) would loop in
-        // the offline queue until <stream:error>. Custom handlers ack on their
-        // own; status is covered by should_ack. Ack from `nr` so `recipient`
-        // survives (parse_message_info drops it on non-self branches).
+        // Unknown-only stanzas would loop in the offline queue until
+        // <stream:error>. Custom handlers ack on their own; status is covered
+        // by should_ack. Ack from `nr` so `recipient` survives. Skip when any
+        // bucket has usable payloads (including msmsg) so the regular dispatch
+        // path runs and the valid enc still decrypts.
         if session_payloads.is_empty()
             && group_payloads.is_empty()
+            && bot_payloads.is_empty()
             && had_unknown_enc
             && !had_custom_handler
         {
@@ -632,6 +982,7 @@ impl Client {
             sender_encryption_jid,
             session_payloads,
             group_payloads,
+            bot_payloads,
             max_sender_retry_count,
             decrypt_fail_mode: if has_hide_fail {
                 crate::types::events::DecryptFailMode::Hide
@@ -648,6 +999,7 @@ impl Client {
             sender_encryption_jid,
             session_payloads,
             group_payloads,
+            bot_payloads,
             max_sender_retry_count,
             decrypt_fail_mode,
         } = msg;
@@ -842,6 +1194,13 @@ impl Client {
             // (a status SKDM pkmsg can reach here), so skip it to avoid a
             // redundant receipt.
             self.ack_received_message(&info);
+        }
+
+        // Bot-secret (msmsg) payloads run inline here so they're serialised
+        // with the session/group decrypt batches under the same global
+        // permit + per-chat enqueue lock acquired upstream.
+        for payload in bot_payloads {
+            self.handle_msmsg_payload(&info, payload).await;
         }
 
         // Flush cached Signal state to DB (matches WA Web's flushBufferToDiskIfNotMemOnlyMode)
@@ -1579,7 +1938,7 @@ impl Client {
                 info.id
             );
         } else {
-            self.dispatch_parsed_message(msg, info);
+            self.dispatch_parsed_message(msg, info).await;
         }
         Ok(())
     }
@@ -7167,6 +7526,7 @@ mod tests {
                 sender_encryption_jid: sender.clone(),
                 session_payloads: vec![payload],
                 group_payloads: vec![],
+                bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
             })
@@ -7295,7 +7655,7 @@ mod tests {
             .attr("id", "MSMSG1")
             .attr("type", "text")
             .children([NodeBuilder::new("enc")
-                .attr("type", "msmsg")
+                .attr("type", "frskmsg")
                 .bytes(vec![0u8; 8])
                 .build()])
             .build();
@@ -7328,7 +7688,7 @@ mod tests {
             .attr("id", "MSMSG_LID")
             .attr("type", "text")
             .children([NodeBuilder::new("enc")
-                .attr("type", "msmsg")
+                .attr("type", "frskmsg")
                 .bytes(vec![0u8; 8])
                 .build()])
             .build();
@@ -7389,7 +7749,7 @@ mod tests {
             .attr("type", "text")
             .attr("participant", "5511777776666@s.whatsapp.net")
             .children([NodeBuilder::new("enc")
-                .attr("type", "msmsg")
+                .attr("type", "frskmsg")
                 .bytes(vec![0u8; 8])
                 .build()])
             .build();
@@ -7424,7 +7784,7 @@ mod tests {
                     .bytes(vec![0u8; 8])
                     .build(),
                 NodeBuilder::new("enc")
-                    .attr("type", "msmsg")
+                    .attr("type", "frskmsg")
                     .bytes(vec![0u8; 8])
                     .build(),
             ])
@@ -7470,14 +7830,14 @@ mod tests {
             .custom_enc_handlers
             .write()
             .await
-            .insert("msmsg".to_string(), handler as Arc<dyn EncHandler>);
+            .insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
 
         let node = NodeBuilder::new("message")
             .attr("from", "5511777776666@s.whatsapp.net")
             .attr("id", "CUSTOM1")
             .attr("type", "text")
             .children([NodeBuilder::new("enc")
-                .attr("type", "msmsg")
+                .attr("type", "frskmsg")
                 .bytes(vec![0u8; 8])
                 .build()])
             .build();
@@ -7567,5 +7927,1643 @@ mod tests {
             backend.get_sync_key(&key_id).await.unwrap().is_some(),
             "app-state sync key from self must be stored"
         );
+    }
+
+    // ---- msmsg inbound dispatch -----------------------------------------
+
+    fn find_message_nack_error(frames: &[bytes::Bytes], id: &str) -> Option<u32> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "ack"
+                && node
+                    .get_attr("class")
+                    .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && let Some(err) = node.get_attr("error")
+                && let Ok(code) = err.as_str().parse::<u32>()
+            {
+                return Some(code);
+            }
+        }
+        None
+    }
+
+    fn encode_message_secret_message(iv: &[u8], payload: &[u8]) -> Vec<u8> {
+        use prost::Message as _;
+        let ms = wa::MessageSecretMessage {
+            version: Some(1),
+            enc_iv: Some(iv.to_vec()),
+            enc_payload: Some(payload.to_vec()),
+        };
+        let mut out = Vec::with_capacity(ms.encoded_len());
+        ms.encode(&mut out).expect("encode MessageSecretMessage");
+        out
+    }
+
+    async fn collect_event<F>(
+        client: &Arc<Client>,
+        collector: Arc<crate::test_utils::TestEventCollector>,
+        pred: F,
+        timeout_ms: u64,
+    ) -> Option<Arc<wacore::types::events::Event>>
+    where
+        F: Fn(&wacore::types::events::Event) -> bool,
+    {
+        let _ = client;
+        let mut waited = 0u64;
+        while waited <= timeout_ms {
+            for ev in collector.events() {
+                if pred(&ev) {
+                    return Some(ev);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            waited += 25;
+        }
+        None
+    }
+
+    /// Round-trip: store an outbound messageSecret, build a fake bot reply
+    /// whose payload we encrypt with the symmetric helper, route it through
+    /// classify, and assert the decrypted `wa::Message` lands on the bus.
+    #[tokio::test]
+    async fn msmsg_decrypts_when_secret_is_stored() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_ok").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let bot_jid = "867051314767696@bot";
+        let outbound_id = "OUTBOUND_1";
+        let bot_reply_id = "BOT_REPLY_1";
+        let secret = [0x42u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("hi from bot".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", bot_jid)
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("hi from bot"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "msmsg decryption + dispatch must surface Event::Message"
+        );
+    }
+
+    /// No secret stored for `target_id` → nack `error=495`, no Message event.
+    #[tokio::test]
+    async fn msmsg_without_stored_secret_nacks_495() {
+        let (client, transport) = capturing_client("msmsg_nosecret").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let bot_reply_id = "BOT_REPLY_NS";
+        let outbound_id = "OUTBOUND_NS";
+        let our_pn = "5511000000001@s.whatsapp.net";
+
+        let ms_msg_proto = encode_message_secret_message(&[0u8; 12], &[0u8; 32]);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), bot_reply_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            code,
+            Some(495),
+            "missing messageSecret must nack with code 495"
+        );
+        assert!(
+            collector
+                .events()
+                .iter()
+                .all(|e| !matches!(e.as_ref(), wacore::types::events::Event::Message(_, info) if info.id == bot_reply_id)),
+            "no Message event must be dispatched when decryption failed"
+        );
+    }
+
+    /// Tampered ciphertext → GCM tag fails → nack 495.
+    #[tokio::test]
+    async fn msmsg_with_bad_tag_nacks_495() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, transport) = capturing_client("msmsg_bad_tag").await;
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_BAD";
+        let bot_reply_id = "BOT_REPLY_BAD";
+        let secret = [0x77u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (mut cipher, iv) = encrypt_bot_message(b"hello", &secret, &ctx).unwrap();
+        let last = cipher.len() - 1;
+        cipher[last] ^= 0x01;
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), bot_reply_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(code, Some(495));
+    }
+
+    /// Bot edit chain: when `<bot edit="inner">` is set, the HKDF msg_id used
+    /// for the per-message key swaps to `edit_target_id` so the edited reply
+    /// decrypts under the same key as the original (whatsmeow / WA Web
+    /// `decryptMsmsgFbidBotMessage`).
+    #[tokio::test]
+    async fn msmsg_bot_edit_uses_edit_target_id_for_hkdf() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_edit").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_EDIT";
+        let original_reply_id = "BOT_REPLY_FIRST";
+        let edit_reply_id = "BOT_REPLY_EDIT";
+        let secret = [0xAAu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt as if it's the ORIGINAL reply (msg_id = original_reply_id).
+        let plaintext_msg = wa::Message {
+            conversation: Some("edited content".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: original_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        // Inbound stanza has id=edit_reply_id but <bot edit="inner" edit_target_id=original>
+        // so the HKDF must derive against original_reply_id.
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", edit_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot")
+                    .attr("edit", "inner")
+                    .attr("edit_target_id", original_reply_id)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_reply_id
+                        && msg.conversation.as_deref() == Some("edited content"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "bot edit must use edit_target_id for HKDF msg_id"
+        );
+    }
+
+    /// Same setup as the edit test but WITHOUT `<bot edit>`: the HKDF must
+    /// fall back to `info.id`, and ciphertext encrypted with the edit-target
+    /// id must fail to decrypt.
+    #[tokio::test]
+    async fn msmsg_without_bot_edit_does_not_swap_msg_id() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, transport) = capturing_client("msmsg_noedit").await;
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_NOEDIT";
+        let stanza_id = "BOT_REPLY_NOEDIT";
+        let other_id = "OTHER_ID";
+        let secret = [0xBBu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt with `other_id` to simulate the wrong key derivation if the
+        // edit branch were taken without `<bot edit>`.
+        let ctx = BotMessageContext {
+            msg_id: other_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(b"x", &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), stanza_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            code,
+            Some(495),
+            "without <bot edit>, HKDF must use stanza id (not OTHER_ID) → tag fails"
+        );
+    }
+
+    /// `<bot edit="first">` is NOT one of {INNER, LAST}, so the HKDF msg_id
+    /// must remain `info.id`.
+    #[tokio::test]
+    async fn msmsg_bot_edit_first_keeps_info_id() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_first").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_FIRST";
+        let stanza_id = "BOT_REPLY_FIRST";
+        let secret = [0xCCu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt with stanza_id; "first" edit must NOT swap.
+        let plaintext_msg = wa::Message {
+            conversation: Some("first reply".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: stanza_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot").attr("edit", "first").build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| matches!(e, wacore::types::events::Event::Message(_, info) if info.id == stanza_id),
+            1500,
+        )
+        .await;
+        assert!(got.is_some(), "edit=first must keep info.id as HKDF msg_id");
+    }
+
+    /// Regular bot path (`f()` in WA Web `BotMessageSecret.js`): when the
+    /// fbid pre-resolve picks the WRONG id (e.g. edit_target_id) but the
+    /// real ciphertext was minted under `info.id`, the fallback attempt
+    /// must succeed. Validates the try-then-fallback unification.
+    #[tokio::test]
+    async fn msmsg_falls_back_to_info_id_when_primary_uses_edit_target() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_fb_to_info").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_FB1";
+        let stanza_id = "REPLY_FB1";
+        let edit_target_id = "WRONG_EDIT_TARGET";
+        let secret = [0xDDu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt under `stanza_id` even though the stanza will declare
+        // edit=inner with edit_target_id (forces a primary-attempt mismatch).
+        let plaintext_msg = wa::Message {
+            conversation: Some("fallback ok".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: stanza_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot")
+                    .attr("edit", "inner")
+                    .attr("edit_target_id", edit_target_id)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == stanza_id
+                        && msg.conversation.as_deref() == Some("fallback ok"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "primary attempt with edit_target_id must fall back to info.id"
+        );
+    }
+
+    /// Inverse of the `falls_back_to_info_id` test: primary is `info.id`
+    /// (edit_type isn't INNER/LAST so the fbid pre-resolve picks the stanza
+    /// id), but the bot encrypted under `edit_target_id`. The fallback must
+    /// rescue.
+    #[tokio::test]
+    async fn msmsg_falls_back_to_edit_target_when_primary_uses_info_id() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_fb_to_edit").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_INV";
+        let stanza_id = "REPLY_INV";
+        let edit_target_id = "EDIT_INV";
+        let secret = [0xBEu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("inverse fallback".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        // Encrypt under edit_target_id even though edit=first → primary
+        // will pick info.id (stanza id), fail, and the fallback should try
+        // edit_target_id and succeed (WA Web regular bot path `f()`).
+        let ctx = BotMessageContext {
+            msg_id: edit_target_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot")
+                    .attr("edit", "first")
+                    .attr("edit_target_id", edit_target_id)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == stanza_id
+                        && msg.conversation.as_deref() == Some("inverse fallback"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "primary attempt with info.id must fall back to edit_target_id (WA Web f())"
+        );
+    }
+
+    /// Mirror scenario: no `<bot edit>`, so the parser doesn't populate
+    /// `edit_target_id`. Primary uses `info.id`; with no fallback id
+    /// available, a deliberately-wrong-key payload must nack 495 (no second
+    /// attempt to silently mask the failure).
+    #[tokio::test]
+    async fn msmsg_no_fallback_when_no_edit_target_present() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, transport) = capturing_client("msmsg_nofb").await;
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_NOFB";
+        let stanza_id = "REPLY_NOFB";
+        let secret = [0xCCu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt under a DIFFERENT id; no <bot> node so parser leaves
+        // edit_target_id = None and there's nothing to fall back to.
+        let ctx = BotMessageContext {
+            msg_id: "MISMATCHED_ID",
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(b"x", &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), stanza_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            code,
+            Some(495),
+            "no fallback id available → single AES-GCM failure must nack 495"
+        );
+    }
+
+    /// WA Web `processRenderableMessages` captures the embedded
+    /// `messageSecret` from any bot-targeted msg (fanout from us OR reply
+    /// from the bot). Verify the helper persists it under
+    /// (bot_chat, our_lid, info.id).
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_persists_for_bot_chats() {
+        use crate::store::commands::DeviceCommand;
+        let (client, _transport) = capturing_client("capture_bot").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+
+        let info = Arc::new(MessageInfo {
+            id: "FANOUT_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            conversation: Some("hi bot".into()),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xAB; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        let mut got = None;
+        for _ in 0..40 {
+            got = client
+                .persistence_manager
+                .backend()
+                .get_msg_secret("867051314767696@bot", "999888777666555@lid", "FANOUT_1")
+                .await
+                .unwrap();
+            if got.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(got.as_deref(), Some(&[0xABu8; 32][..]));
+    }
+
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_skips_non_bot_chats() {
+        let (client, _transport) = capturing_client("capture_skip_dm").await;
+        let info = Arc::new(MessageInfo {
+            id: "DM_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: "5511777776666@s.whatsapp.net".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xCD; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "5511777776666@s.whatsapp.net",
+                "5511000000001@s.whatsapp.net",
+                "DM_1",
+            )
+            .await
+            .unwrap();
+        assert!(
+            got.is_none(),
+            "non-bot chats must not persist embedded msg_secrets"
+        );
+    }
+
+    /// Group invocation: user mentions @MetaAI in a group → chat is the
+    /// GROUP (not bot), but mentioned_jid contains the bot. WA Web's
+    /// `processRenderableMessages` keys off `N` (invokedBotWid derived from
+    /// `mentionedJidList.find(isBot)`); we must persist too.
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_persists_for_group_with_bot_mention() {
+        use crate::store::commands::DeviceCommand;
+        let (client, _transport) = capturing_client("capture_group_mention").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+
+        let info = Arc::new(MessageInfo {
+            id: "GRP_MENTION".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("hey @MetaAI tell me a joke".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec!["867051314767696@bot".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xEE; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        let mut got = None;
+        for _ in 0..40 {
+            got = client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(
+                    "120363021033254949@g.us",
+                    "5511000000001@s.whatsapp.net",
+                    "GRP_MENTION",
+                )
+                .await
+                .unwrap();
+            if got.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0xEEu8; 32][..]),
+            "group invocation via @bot mention must still cache the secret"
+        );
+    }
+
+    /// Forwarded message with a secret must NOT be cached — matches WA Web's
+    /// `x.isForwarded !== true` guard. A planted forward shouldn't poison
+    /// the cache.
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_skips_forwarded() {
+        let (client, _transport) = capturing_client("capture_skip_forwarded").await;
+        let info = Arc::new(MessageInfo {
+            id: "FWD_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("forwarded".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xFF; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "867051314767696@bot",
+                "5511000000001@s.whatsapp.net",
+                "FWD_1",
+            )
+            .await
+            .unwrap();
+        assert!(got.is_none(), "forwarded messages must not seed the cache");
+    }
+
+    /// Our own group bot prompt carries the secret but NO mentioned_jid
+    /// (observed in prod: `mentions_bot=false mentioned_jids=[]`). The bot
+    /// invocation is signalled by `message_context_info.bot_metadata`, which
+    /// must let the capture fire (WA Web's `w`/`A` group-participant gate).
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_via_bot_metadata_without_mention() {
+        let (client, _transport) = capturing_client("capture_bot_meta").await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let info = Arc::new(MessageInfo {
+            id: "GRP_OWN_BOT".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "236395184570386:0@lid".parse().unwrap(),
+                is_from_me: true,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("continue".into()),
+                // No mention at all — just bot_metadata signals the invocation.
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0x7B; 32]),
+                bot_metadata: Some(wa::BotMetadata {
+                    persona_id: Some("867051314767696".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        // Group (non-bot chat) → keyed under info.source.sender (our LID in a
+        // LID group), which is what the bot reply's target_sender_jid echoes.
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "120363021033254949@g.us",
+                "236395184570386@lid",
+                "GRP_OWN_BOT",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0x7Bu8; 32][..]),
+            "bot_metadata presence must let our own group prompt cache without a mention"
+        );
+    }
+
+    /// Group flow: another participant invokes the bot, their decrypted prompt
+    /// carries the secret. We must key it under THE PARTICIPANT (the future
+    /// reply's `<meta target_sender_jid>`), not our own identity.
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_keys_under_other_participant() {
+        let (client, _transport) = capturing_client("capture_participant").await;
+        let participant = "5599111112222:7@s.whatsapp.net";
+        let info = Arc::new(MessageInfo {
+            id: "GRP_OTHER".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: participant.parse().unwrap(),
+                is_from_me: false,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("@MetaAI question".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec!["867051314767696@bot".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0x5A; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        // Keyed under the participant (non-AD), NOT under our own PN/LID.
+        let under_participant = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "120363021033254949@g.us",
+                "5599111112222@s.whatsapp.net",
+                "GRP_OTHER",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            under_participant.as_deref(),
+            Some(&[0x5Au8; 32][..]),
+            "another participant's prompt must key under their sender JID"
+        );
+    }
+
+    /// WA Web `sendAggregateReceipts`: a bot reply in a GROUP (chat not bot,
+    /// author is bot) must ack with a bare `<ack class="message">`
+    /// (sendBotInvokeResponseAcks), NOT a `<receipt>`.
+    #[tokio::test]
+    async fn bot_reply_in_group_acks_with_bare_ack_not_receipt() {
+        let (client, transport) = capturing_client("bot_group_ack").await;
+        let info = Arc::new(MessageInfo {
+            id: "BOT_GRP_ACK".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "867051314767696@bot".parse().unwrap(),
+                is_from_me: false,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&info);
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            found.is_some(),
+            "group bot reply must emit a bare <ack class=\"message\">"
+        );
+        assert_eq!(
+            delivery_receipts_for(&transport.sent(), "BOT_GRP_ACK"),
+            0,
+            "group bot reply must NOT emit a <receipt>"
+        );
+    }
+
+    /// Regression: a 1:1 bot chat (chat IS the bot) keeps the normal delivery
+    /// `<receipt>` — WA Web's `v` gate is false when chat.isBot().
+    #[tokio::test]
+    async fn bot_dm_reply_keeps_delivery_receipt() {
+        let (client, transport) = capturing_client("bot_dm_receipt").await;
+        let info = Arc::new(MessageInfo {
+            id: "BOT_DM_RCPT".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "867051314767696@bot".parse().unwrap(),
+                is_from_me: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&info);
+
+        let mut count = 0;
+        for _ in 0..80 {
+            count = delivery_receipts_for(&transport.sent(), "BOT_DM_RCPT");
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            count, 1,
+            "1:1 bot chat must keep the normal delivery receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_skips_when_secret_absent() {
+        let (client, _transport) = capturing_client("capture_no_secret").await;
+        let info = Arc::new(MessageInfo {
+            id: "NO_SECRET".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "867051314767696@bot",
+                "5511000000001@s.whatsapp.net",
+                "NO_SECRET",
+            )
+            .await
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    /// A stanza carrying BOTH a valid msmsg AND an unknown sibling enc must
+    /// still dispatch the msmsg — the unknown-only fallback ack must not
+    /// short-circuit when `bot_payloads` is non-empty.
+    #[tokio::test]
+    async fn mixed_msmsg_and_unknown_enc_still_decrypts_msmsg() {
+        use crate::store::commands::DeviceCommand;
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+
+        let (client, _transport) = capturing_client("msmsg_mixed_unknown").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_lid = "999888777666555@lid";
+        let outbound_id = "OUT_MIX";
+        let bot_reply_id = "REPLY_MIX";
+        let secret = [0x55u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_lid, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("mixed ok".into()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        // Stanza has a valid msmsg PLUS an unrecognised "frskmsg" sibling.
+        // The fallback transport-ack must NOT fire (would drop the msmsg).
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "frskmsg")
+                    .bytes(vec![0u8; 8])
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("mixed ok"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "msmsg sibling of an unknown enc must still decrypt and dispatch"
+        );
+    }
+
+    /// LID↔PN migration window: the secret was stored under our PN, but the
+    /// bot reply's `<meta target_sender_jid>` echoes our LID. The primary
+    /// lookup misses; `alternate_msg_secret_lookup` resolves PN via
+    /// `lid_pn_mapping` and hits. Mirrors WA Web `C()`'s `getAlternateMsgKey`.
+    #[tokio::test]
+    async fn msmsg_alternate_lookup_resolves_lid_to_stored_pn() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        use wacore::store::traits::LidPnMappingEntry;
+
+        let (client, _transport) = capturing_client("msmsg_alt_lookup").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_lid_user = "999888777666555";
+        let our_pn_user = "5511000000001";
+        let our_lid = "999888777666555@lid";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_ALT";
+        let bot_reply_id = "REPLY_ALT";
+        let secret = [0x3Cu8; 32];
+
+        // Seed the LID→PN mapping so the alternate lookup can swap.
+        client
+            .persistence_manager
+            .backend()
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: our_lid_user.into(),
+                phone_number: our_pn_user.into(),
+                created_at: 0,
+                updated_at: 0,
+                learning_source: "test".into(),
+            })
+            .await
+            .unwrap();
+        // Secret stored under PN (as if the outbound went out PN-addressed).
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Bot reply encrypts with target = our LID (what <meta> declares).
+        let plaintext_msg = wa::Message {
+            conversation: Some("alt ok".into()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("alt ok"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "LID-declared reply must resolve the PN-stored secret via lid_pn_mapping"
+        );
+    }
+
+    /// End-to-end: phone fanout dispatches a wa::Message carrying the
+    /// outbound `messageSecret`; later the Meta AI bot replies via msmsg
+    /// referencing the same id. The captured secret must let the reply
+    /// decrypt and surface `Event::Message`.
+    #[tokio::test]
+    async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
+        use crate::store::commands::DeviceCommand;
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+
+        let (client, _transport) = capturing_client("fanout_to_msmsg").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+        let our_lid_str = "999888777666555@lid";
+        let outbound_id = "FANOUT_OUT";
+        let bot_reply_id = "BOT_REPLY_PHONE";
+        let secret = [0x99u8; 32];
+
+        // Step 1: simulate the fanout dispatch (what dispatch_parsed_message
+        // would call when the phone's outbound stanza is mirrored to us).
+        let fanout_info = Arc::new(MessageInfo {
+            id: outbound_id.into(),
+            source: crate::types::message::MessageSource {
+                chat: bot_chat.clone(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let fanout_msg = wa::Message {
+            conversation: Some("hi bot".into()),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(secret.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client
+            .maybe_capture_inbound_msg_secret(&fanout_msg, &fanout_info)
+            .await;
+        // Write is awaited inline now, so the secret is already durable here.
+        for _ in 0..40 {
+            if client
+                .persistence_manager
+                .backend()
+                .get_msg_secret("867051314767696@bot", our_lid_str, outbound_id)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Step 2: the bot reply arrives as <enc type="msmsg"> referencing
+        // outbound_id via <meta target_id>. With the secret captured above,
+        // it must decrypt cleanly.
+        let plaintext_msg = wa::Message {
+            conversation: Some("bot reply".into()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid_str,
+            bot_user_jid: "867051314767696@bot",
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid_str)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("bot reply"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "secret captured from fanout must enable msmsg reply decryption"
+        );
+    }
+
+    /// Coherence: the identity `persist_outbound_msg_secret` writes under
+    /// (LID for bot chats) must match what `handle_msmsg_payload` reads via
+    /// `<meta target_sender_jid>`. End-to-end without bypassing the helper.
+    #[tokio::test]
+    async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
+        use crate::store::commands::DeviceCommand;
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+
+        let (client, _transport) = capturing_client("msmsg_lid_match").await;
+        // Seed both PN (already seeded by capturing_client) and LID.
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+        let outbound_id = "OUT_LID";
+        let bot_reply_id = "REPLY_LID";
+        let our_lid = "999888777666555@lid";
+        let secret = [0x71u8; 32];
+
+        // Real outbound path: caller resolves the bot identity to our LID.
+        let sender_identity = client
+            .dm_sender_identity_for(&bot_chat)
+            .await
+            .expect("LID seeded");
+        client
+            .persist_outbound_msg_secret(&bot_chat, &sender_identity, outbound_id, &secret)
+            .await;
+
+        // Inbound msmsg payload encrypted under the same (msg_id, target, bot)
+        // tuple the meta will declare on the wire.
+        let plaintext_msg = wa::Message {
+            conversation: Some("lid coherent".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid,
+            bot_user_jid: "867051314767696@bot",
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("lid coherent"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "outbound PUT and inbound GET must converge on LID for bot chats"
+        );
+    }
+
+    /// Regression for the AD_JID encoder bug: a `from="USER:0@bot"` stanza must
+    /// survive the marshal/unmarshal round-trip with `server=Bot`, so the
+    /// secret lookup keys hit and the reply decrypts.
+    #[tokio::test]
+    async fn msmsg_with_bot_device_suffix_round_trips() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_bot_device").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_DEV";
+        let bot_reply_id = "BOT_REPLY_DEV";
+        let secret = [0x33u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("with device".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696:0@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("with device"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "msmsg with `:0@bot` from must round-trip (encoder must not strip the bot server)"
+        );
+    }
+
+    /// `<meta>` without `target_id` → cannot identify the parent message,
+    /// nack 495 and no dispatch.
+    #[tokio::test]
+    async fn msmsg_without_meta_target_id_nacks_495() {
+        let (client, transport) = capturing_client("msmsg_no_target").await;
+        let bot_reply_id = "BOT_REPLY_NT";
+        let ms_msg_proto = encode_message_secret_message(&[0u8; 12], &[0u8; 32]);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .attr("v", "2")
+                .bytes(ms_msg_proto)
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), bot_reply_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(code, Some(495));
     }
 }

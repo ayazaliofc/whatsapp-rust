@@ -194,6 +194,13 @@ pub struct CacheConfig {
     /// 0 = no automatic cleanup. Default: 300 (5 minutes).
     pub sent_message_ttl_secs: u64,
 
+    // --- MsgSecret retention ---
+    /// TTL in seconds for stored `messageSecret` rows before periodic
+    /// cleanup. `0` (default) disables automatic pruning, matching
+    /// whatsmeow and WA Web. Set to a positive value (e.g. `30 * 86_400`
+    /// for 30 days) to bound DB growth on long-running deployments.
+    pub msg_secret_ttl_secs: u64,
+
     // --- Custom store overrides ---
     /// Per-cache custom store overrides.
     ///
@@ -222,6 +229,7 @@ impl std::fmt::Debug for CacheConfig {
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
+            .field("msg_secret_ttl_secs", &self.msg_secret_ttl_secs)
             .field(
                 "cache_stores.group_cache",
                 &self.cache_stores.group_cache.is_some(),
@@ -260,6 +268,10 @@ impl Default for CacheConfig {
             session_locks_capacity: 10_000,
             chat_lanes_capacity: 5_000,
             sent_message_ttl_secs: 300,
+            // Disabled by default — match whatsmeow and WA Web (neither
+            // expires stored secrets). Callers expecting long-lived bot
+            // conversations, polls, or reactions can opt in.
+            msg_secret_ttl_secs: 0,
             cache_stores: CacheStores::default(),
         }
     }

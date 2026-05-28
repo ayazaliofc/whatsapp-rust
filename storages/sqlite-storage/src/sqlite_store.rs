@@ -2505,6 +2505,102 @@ impl ProtocolStore for SqliteStore {
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl MsgSecretStore for SqliteStore {
+    async fn put_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+        secret: &[u8],
+    ) -> Result<()> {
+        let device_id = self.device_id;
+        let chat: Arc<str> = Arc::from(chat);
+        let sender: Arc<str> = Arc::from(sender);
+        let msg_id: Arc<str> = Arc::from(msg_id);
+        let secret: Arc<[u8]> = Arc::from(secret);
+        let now = wacore::time::now_secs();
+        self.with_retry("put_msg_secret", || {
+            let chat = Arc::clone(&chat);
+            let sender = Arc::clone(&sender);
+            let msg_id = Arc::clone(&msg_id);
+            let secret = Arc::clone(&secret);
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::insert_into(msg_secrets::table)
+                    .values((
+                        msg_secrets::chat.eq(chat.as_ref()),
+                        msg_secrets::sender.eq(sender.as_ref()),
+                        msg_secrets::msg_id.eq(msg_id.as_ref()),
+                        msg_secrets::secret.eq(secret.as_ref()),
+                        msg_secrets::device_id.eq(device_id),
+                        msg_secrets::created_at.eq(now),
+                    ))
+                    .on_conflict((
+                        msg_secrets::chat,
+                        msg_secrets::sender,
+                        msg_secrets::msg_id,
+                        msg_secrets::device_id,
+                    ))
+                    .do_update()
+                    .set((
+                        msg_secrets::secret.eq(secret.as_ref()),
+                        msg_secrets::created_at.eq(now),
+                    ))
+                    .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn get_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let chat = chat.to_string();
+        let sender = sender.to_string();
+        let msg_id = msg_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let row: Option<Vec<u8>> = msg_secrets::table
+                .select(msg_secrets::secret)
+                .filter(msg_secrets::chat.eq(&chat))
+                .filter(msg_secrets::sender.eq(&sender))
+                .filter(msg_secrets::msg_id.eq(&msg_id))
+                .filter(msg_secrets::device_id.eq(device_id))
+                .first(&mut conn)
+                .optional()
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(row)
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
+
+    async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let device_id = self.device_id;
+        self.with_retry("delete_expired_msg_secrets", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                let deleted = diesel::delete(
+                    msg_secrets::table
+                        .filter(msg_secrets::created_at.lt(cutoff_timestamp))
+                        .filter(msg_secrets::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
+        })
+        .await
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl DeviceStore for SqliteStore {
     async fn save(&self, device: &CoreDevice) -> Result<()> {
         SqliteStore::save_device_data_for_device(self, self.device_id, device).await
@@ -3092,6 +3188,154 @@ mod tests {
         assert!(
             reloaded.server_cert_chain.is_none(),
             "cleared chain must round-trip as None"
+        );
+    }
+
+    #[tokio::test]
+    async fn msg_secret_round_trip_sqlite() {
+        let store = create_test_store().await;
+        let secret = [0xABu8; 32];
+        store
+            .put_msg_secret("12345@s.whatsapp.net", "9999@lid", "MID1", &secret)
+            .await
+            .expect("put");
+        let got = store
+            .get_msg_secret("12345@s.whatsapp.net", "9999@lid", "MID1")
+            .await
+            .expect("get")
+            .expect("must exist");
+        assert_eq!(got, secret.to_vec());
+    }
+
+    #[tokio::test]
+    async fn msg_secret_miss_returns_none_sqlite() {
+        let store = create_test_store().await;
+        assert!(
+            store
+                .get_msg_secret("any@s.whatsapp.net", "any@lid", "NOPE")
+                .await
+                .expect("get")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn msg_secret_upsert_replaces_secret() {
+        let store = create_test_store().await;
+        store
+            .put_msg_secret("c", "s", "M", &[1u8; 32])
+            .await
+            .expect("put 1");
+        store
+            .put_msg_secret("c", "s", "M", &[9u8; 32])
+            .await
+            .expect("put 2");
+        let got = store.get_msg_secret("c", "s", "M").await.unwrap().unwrap();
+        assert_eq!(got, vec![9u8; 32], "ON CONFLICT must overwrite");
+    }
+
+    #[tokio::test]
+    async fn msg_secret_scoped_by_three_columns() {
+        let store = create_test_store().await;
+        store
+            .put_msg_secret("c1", "s1", "M1", &[1u8; 32])
+            .await
+            .unwrap();
+        store
+            .put_msg_secret("c1", "s1", "M2", &[2u8; 32])
+            .await
+            .unwrap();
+        store
+            .put_msg_secret("c1", "s2", "M1", &[3u8; 32])
+            .await
+            .unwrap();
+        store
+            .put_msg_secret("c2", "s1", "M1", &[4u8; 32])
+            .await
+            .unwrap();
+
+        for (chat, sender, msg_id, expected) in [
+            ("c1", "s1", "M1", 1u8),
+            ("c1", "s1", "M2", 2),
+            ("c1", "s2", "M1", 3),
+            ("c2", "s1", "M1", 4),
+        ] {
+            let got = store
+                .get_msg_secret(chat, sender, msg_id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing ({chat},{sender},{msg_id})"));
+            assert_eq!(got, vec![expected; 32]);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_expired_msg_secrets_deletes_only_below_cutoff() {
+        let store = create_test_store().await;
+        store
+            .put_msg_secret("c", "s", "M", &[7u8; 32])
+            .await
+            .unwrap();
+        let now = wacore::time::now_secs();
+        // cutoff well before insert → nothing deleted
+        let removed = store
+            .delete_expired_msg_secrets(now - 86_400)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        assert!(
+            store.get_msg_secret("c", "s", "M").await.unwrap().is_some(),
+            "row newer than cutoff must survive"
+        );
+        // cutoff after insert → deleted
+        let removed = store
+            .delete_expired_msg_secrets(now + 86_400)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(store.get_msg_secret("c", "s", "M").await.unwrap().is_none());
+    }
+
+    /// Multi-account isolation: same DB, different device_id rows must not
+    /// collide on the same logical key.
+    #[tokio::test]
+    async fn msg_secret_isolated_per_device_id() {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let shared_url = format!(
+            "file:memdb_msgsecret_iso_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            id
+        );
+        let store_a = SqliteStore::new_for_device(&shared_url, 1)
+            .await
+            .expect("store_a");
+        let store_b = SqliteStore::new_for_device(&shared_url, 2)
+            .await
+            .expect("store_b");
+
+        store_a
+            .put_msg_secret("c", "s", "M", &[7u8; 32])
+            .await
+            .unwrap();
+        assert!(
+            store_b
+                .get_msg_secret("c", "s", "M")
+                .await
+                .unwrap()
+                .is_none(),
+            "same DB, different device_id must not see each other's secrets"
+        );
+        assert_eq!(
+            store_a
+                .get_msg_secret("c", "s", "M")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![7u8; 32],
+            "device_a still sees its own write"
         );
     }
 }

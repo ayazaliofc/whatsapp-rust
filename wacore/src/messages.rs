@@ -282,6 +282,11 @@ pub fn parse_message_info(
         let mut ma = meta.attrs();
         meta_info.content_type = ma.optional_string("content_type").map(|s| s.into_owned());
         meta_info.appdata = ma.optional_string("appdata").map(|s| s.into_owned());
+        // msmsg addon path needs the trio (target_id, target_sender_jid,
+        // target_chat_jid) to look up the parent messageSecret.
+        meta_info.target_id = ma.optional_string("target_id").map(|s| s.into_owned());
+        meta_info.target_sender = ma.optional_jid("target_sender_jid");
+        meta_info.target_chat = ma.optional_jid("target_chat_jid");
     }
     if let Some(reporting) = node.get_optional_child("reporting")
         && let Some(tag) = reporting.get_optional_child("reporting_tag")
@@ -303,6 +308,24 @@ pub fn parse_message_info(
         );
     }
 
+    // <bot edit="..."> child. Mirror WA Web `f()`: read `edit_target_id`
+    // unconditionally so the msmsg regular-bot fallback path can consume it
+    // regardless of edit_type. fbid (`h()`) only uses it for INNER/LAST,
+    // but parsing it always is a strict superset.
+    let bot_info = node.get_optional_child("bot").map(|bot_node| {
+        let mut ba = bot_node.attrs();
+        crate::types::message::MsgBotInfo {
+            edit_type: ba
+                .optional_string("edit")
+                .and_then(|s| crate::types::message::BotEditType::from_wire(s.as_ref())),
+            edit_target_id: ba.optional_string("edit_target_id").map(|s| s.into_owned()),
+            edit_sender_timestamp_ms: ba
+                .optional_u64("sender_timestamp_ms")
+                .and_then(|ms| i64::try_from(ms).ok())
+                .and_then(crate::time::from_millis),
+        }
+    });
+
     Ok(MessageInfo {
         source,
         id,
@@ -323,6 +346,7 @@ pub fn parse_message_info(
         verified_name_serial,
         peer_recipient_pn,
         meta_info,
+        bot_info,
         ..Default::default()
     })
 }
