@@ -19,6 +19,7 @@ use futures::future::{Fuse, FusedFuture};
 
 use crate::runtime::{BoxFuture, Runtime};
 use crate::time::Instant;
+use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
 
@@ -37,6 +38,22 @@ pub struct CallChannels {
 /// Depth of the outbound send queue between the drive loop and the concurrent send task. ~2s of RTP
 /// at one 60ms frame per slot; on overflow the oldest is dropped (loss-tolerant), bounding latency.
 const SEND_QUEUE_CAP: usize = 32;
+
+/// Enforce [`SEND_QUEUE_CAP`] on the outbound queue when a relay write stalls. Media is loss
+/// tolerant, but relay control is not: STUN keepalives and the consent Binding Success replies
+/// share this queue, and shedding one under media backpressure fails relay consent (RFC 7675) and
+/// tears down a still recoverable call. So evict the oldest *media* packet, sparing control; only
+/// if the queue is somehow all control do we drop the oldest to keep the bound.
+fn shed_to_cap(queue: &mut VecDeque<Bytes>) {
+    if queue.len() <= SEND_QUEUE_CAP {
+        return;
+    }
+    let victim = queue
+        .iter()
+        .position(|p| classify_relay_packet(p) != RelayPacketKind::Stun)
+        .unwrap_or(0);
+    queue.remove(victim);
+}
 
 /// Drive one call to completion: returns when the relay channel disconnects, a send fails, or the
 /// relay-event stream closes. On exit it calls `transport.disconnect()` so the platform's relay read
@@ -115,9 +132,7 @@ async fn run_call_with_clock(
                 // Queue for the in-flight send arm; never await the write in this loop.
                 Output::Transmit(data) => {
                     send_queue.push_back(data);
-                    if send_queue.len() > SEND_QUEUE_CAP {
-                        send_queue.pop_front();
-                    }
+                    shed_to_cap(&mut send_queue);
                 }
                 // Loss tolerant: drop the frame if the speaker can't keep up.
                 Output::Playout(pcm) => {
@@ -941,6 +956,48 @@ mod tests {
         assert!(
             peak > 0,
             "inbound audio must play out while transport.send() is wedged (send/receive decoupled)"
+        );
+    }
+
+    // A relay stall backs the queue up past cap: the overflow policy must shed media, never the STUN
+    // control (keepalive / consent Binding Success) sharing the queue, or relay consent fails.
+    #[test]
+    fn overflow_sheds_media_and_spares_control() {
+        // version 2 + extension bit -> 0x90, classified as Rtp media.
+        let media = |seq: u8| Bytes::from(vec![0x90, seq]);
+        // Top two bits zero -> STUN control.
+        let control = || Bytes::from(vec![0x00, 0x01]);
+
+        let mut q: VecDeque<Bytes> = VecDeque::new();
+        q.push_back(control()); // oldest, must survive
+        for n in 0..SEND_QUEUE_CAP as u8 {
+            q.push_back(media(n));
+            shed_to_cap(&mut q);
+        }
+
+        assert_eq!(q.len(), SEND_QUEUE_CAP);
+        assert_eq!(
+            classify_relay_packet(&q[0]),
+            RelayPacketKind::Stun,
+            "the queued control packet must not be evicted by media backpressure"
+        );
+        // The oldest media (seq 0) is the one shed, not the control at the front.
+        assert_eq!(&q[1][..], &[0x90, 1]);
+    }
+
+    // Pathological: an all-control queue still has to honor the bound, so it falls back to dropping
+    // the oldest.
+    #[test]
+    fn overflow_all_control_drops_oldest() {
+        let mut q: VecDeque<Bytes> = (0..=SEND_QUEUE_CAP as u8)
+            .map(|n| Bytes::from(vec![0x00, n]))
+            .collect();
+        shed_to_cap(&mut q);
+        assert_eq!(q.len(), SEND_QUEUE_CAP);
+        assert_eq!(
+            &q[0][..],
+            &[0x00, 1],
+            "oldest control dropped to keep bound"
         );
     }
 }
