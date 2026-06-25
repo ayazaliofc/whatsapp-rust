@@ -1,5 +1,5 @@
 use crate::stanza::BusinessSubscription;
-use crate::types::call::{IncomingCall, MissedCall};
+use crate::types::call::{CallEndedElsewhere, IncomingCall, MissedCall};
 use crate::types::message::MessageInfo;
 use crate::types::presence::{ChatPresence, ChatPresenceMedia, ReceiptType};
 use bytes::Bytes;
@@ -233,6 +233,7 @@ pub enum EventKind {
     ContactUpdate,
     IncomingCall,
     MissedCall,
+    CallEndedElsewhere,
     PushNameUpdate,
     SelfPushNameUpdated,
     PinUpdate,
@@ -647,6 +648,11 @@ pub enum Event {
     /// dead call. Mirror of WA Web's `cancel_call` + `missed_call`.
     MissedCall(MissedCall),
 
+    /// An incoming call we were ringing for was answered/declined on another of our devices, so the
+    /// caller dismissed this one. Distinct from [`MissedCall`] -- mirrors WA Web's AcceptedElsewhere /
+    /// Rejected call-log outcomes (`<terminate reason="accepted_elsewhere"|"rejected_elsewhere">`).
+    CallEndedElsewhere(CallEndedElsewhere),
+
     PushNameUpdate(PushNameUpdate),
     SelfPushNameUpdated(SelfPushNameUpdated),
     PinUpdate(PinUpdate),
@@ -737,6 +743,7 @@ impl Event {
             Event::ContactUpdate(_) => EventKind::ContactUpdate,
             Event::IncomingCall(_) => EventKind::IncomingCall,
             Event::MissedCall(_) => EventKind::MissedCall,
+            Event::CallEndedElsewhere(_) => EventKind::CallEndedElsewhere,
             Event::PushNameUpdate(_) => EventKind::PushNameUpdate,
             Event::SelfPushNameUpdated(_) => EventKind::SelfPushNameUpdated,
             Event::PinUpdate(_) => EventKind::PinUpdate,

@@ -1,5 +1,10 @@
-//! Parser for inbound `<call>` stanzas. Returns `Ok(None)` on unknown action
+//! Parser and builders for `<call>` stanzas. Returns `Ok(None)` on unknown action
 //! children so future server additions don't break the handler.
+//!
+//! Wire shapes (tags, attrs, child order) follow the wacrg spec: call-offer (SIG-01),
+//! call-preaccept (SIG-04), call-accept (SIG-03), call-reject (SIG-08),
+//! call-terminate (SIG-14), call-ack (SIG-07). The `<offer>` child order is
+//! server-enforced; a mis-ordered offer is rejected with error 439.
 
 use anyhow::{Result, anyhow};
 use wacore_binary::builder::NodeBuilder;
@@ -270,6 +275,9 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
             call_creator,
         },
         "terminate" => {
+            // WA Web gates the call-log outcome on `reason` (missed vs accepted/rejected-elsewhere),
+            // so surface it instead of dropping it.
+            let reason = attrs.optional_string("reason").map(|c| c.into_owned());
             let duration = attrs
                 .optional_u64("duration")
                 .and_then(|v| u32::try_from(v).ok());
@@ -282,6 +290,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
             CallAction::Terminate {
                 call_id,
                 call_creator,
+                reason,
                 duration,
                 audio_duration,
             }
@@ -332,6 +341,14 @@ pub fn build_offer_ack_receipt(call: &IncomingCall, own_ad: Option<&Jid>) -> Opt
 pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe4, 0xbb, 0x13];
 /// Capability blob for `<preaccept>` (ver=1).
 pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe4, 0xbb, 0x07];
+
+/// `<terminate reason>` wire tokens. The caller-driven sibling dismiss SENDS the `*_ELSEWHERE`
+/// ones; the receive path maps every reason to a call-log outcome (see WA Web's
+/// `ActionWebHandleIncomingSignalingMessage`): `TIMEOUT`/`GROUP_CALL_ENDED`/absent -> missed.
+pub const TERMINATE_REASON_ACCEPTED_ELSEWHERE: &str = "accepted_elsewhere";
+pub const TERMINATE_REASON_REJECTED_ELSEWHERE: &str = "rejected_elsewhere";
+pub const TERMINATE_REASON_TIMEOUT: &str = "timeout";
+pub const TERMINATE_REASON_GROUP_CALL_ENDED: &str = "group_call_ended";
 
 /// Relay latency wire encoding: `0x2000000 + rtt_ms`.
 pub fn encode_latency(rtt_ms: u32) -> String {
@@ -386,12 +403,7 @@ pub fn build_offer(p: &OfferParams<'_>) -> Node {
     );
     children.push(NodeBuilder::new("net").attr("medium", "3").build());
     if let Some(cap) = p.capability {
-        children.push(
-            NodeBuilder::new("capability")
-                .attr("ver", "1")
-                .bytes(cap.to_vec())
-                .build(),
-        );
+        children.push(capability_node(cap));
     }
 
     if p.device_keys.len() > 1 || p.multi_device {
@@ -410,7 +422,7 @@ pub fn build_offer(p: &OfferParams<'_>) -> Node {
         children.push(enc_node(dk));
     }
 
-    children.push(NodeBuilder::new("encopt").attr("keygen", "2").build());
+    children.push(encopt_node());
     if let Some(di) = p.device_identity {
         children.push(
             NodeBuilder::new("device-identity")
@@ -464,14 +476,9 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
         );
     }
     children.push(NodeBuilder::new("net").attr("medium", "2").build());
-    children.push(NodeBuilder::new("encopt").attr("keygen", "2").build());
+    children.push(encopt_node());
     if let Some(cap) = p.capability {
-        children.push(
-            NodeBuilder::new("capability")
-                .attr("ver", "1")
-                .bytes(cap.to_vec())
-                .build(),
-        );
+        children.push(capability_node(cap));
     }
     if let Some(rte) = p.rte {
         children.push(NodeBuilder::new("rte").bytes(rte.to_vec()).build());
@@ -499,6 +506,19 @@ fn audio_opus(rate: &str) -> Node {
         .build()
 }
 
+/// `<encopt keygen=2>`: selects the v2 SRTP key path. Shared by offer/accept/preaccept.
+fn encopt_node() -> Node {
+    NodeBuilder::new("encopt").attr("keygen", "2").build()
+}
+
+/// `<capability ver=1>` carrying its fixed blob. Shared by offer/accept/preaccept.
+fn capability_node(blob: &[u8]) -> Node {
+    NodeBuilder::new("capability")
+        .attr("ver", "1")
+        .bytes(blob.to_vec())
+        .build()
+}
+
 /// `<preaccept>`: audio → encopt → capability(preaccept blob). `id` is the random call-wrapper id.
 pub fn build_preaccept(
     call_id: &str,
@@ -508,13 +528,8 @@ pub fn build_preaccept(
     audio_rates: &[&str],
 ) -> Node {
     let mut children: Vec<Node> = audio_rates.iter().map(|rate| audio_opus(rate)).collect();
-    children.push(NodeBuilder::new("encopt").attr("keygen", "2").build());
-    children.push(
-        NodeBuilder::new("capability")
-            .attr("ver", "1")
-            .bytes(CAPABILITY_PREACCEPT.to_vec())
-            .build(),
-    );
+    children.push(encopt_node());
+    children.push(capability_node(&CAPABILITY_PREACCEPT));
     call_wrap(
         to,
         Some(wrapper_id),
@@ -1093,6 +1108,7 @@ mod tests {
             .children([NodeBuilder::new("terminate")
                 .attr("call-creator", fake_caller_lid())
                 .attr("call-id", "CID")
+                .attr("reason", "timeout")
                 .attr("duration", "3670")
                 .attr("audio_duration", "3670")
                 .build()])
@@ -1101,10 +1117,12 @@ mod tests {
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
         match call.action {
             CallAction::Terminate {
+                reason,
                 duration,
                 audio_duration,
                 ..
             } => {
+                assert_eq!(reason.as_deref(), Some("timeout"));
                 assert_eq!(duration, Some(3670));
                 assert_eq!(audio_duration, Some(3670));
             }
@@ -1344,6 +1362,10 @@ mod tests {
             .collect()
     }
 
+    // Conformance gate for wacrg call-offer (SIG-01): the `<offer>` child order
+    // privacy → audio(8000) → audio(16000) → net → capability → (enc|destination)
+    // → encopt → device-identity is server-enforced (a mis-ordered offer is rejected
+    // with error 439), so this asserts the exact normative order.
     #[test]
     fn offer_child_order_is_load_bearing() {
         let peer = peer();
@@ -1452,6 +1474,9 @@ mod tests {
         assert!(!tags.contains(&"enc".to_string()));
     }
 
+    // Conformance gate for wacrg call-accept (SIG-03) and call-preaccept (SIG-04):
+    // accept order audio… → [te] → net(medium=2) → encopt → [capability]; preaccept
+    // order audio… → encopt → capability. Both echo call-id/call-creator from the offer.
     #[test]
     fn accept_and_preaccept_shape() {
         let peer = peer();

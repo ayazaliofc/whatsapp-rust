@@ -3,9 +3,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use log::{debug, warn};
 #[cfg(feature = "voip")]
-use wacore::stanza::call::{TerminateParams, build_terminate};
+use wacore::stanza::call::{
+    TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
+    TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
+    build_terminate,
+};
 use wacore::stanza::call::{build_offer_ack_receipt, parse_call_stanza};
 use wacore::types::call::{CallAction, IncomingCall, MissedCall, MissedReason};
+#[cfg(feature = "voip")]
+use wacore::types::call::{CallEndedElsewhere, ElsewhereOutcome};
 use wacore::types::events::Event;
 #[cfg(feature = "voip")]
 use wacore_binary::Jid;
@@ -68,6 +74,16 @@ impl StanzaHandler for CallHandler {
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
                         warn!("call: failed to send offer ack receipt: {e}");
                     }
+                    // Track an incoming offer as ringing so only an UNANSWERED <terminate> later
+                    // surfaces a missed call; an answered, outgoing, or duplicate terminate must not.
+                    // Mirrors WA Web's _ringingCalls. The offline branch above already surfaced its
+                    // own missed-offline, so it is intentionally not marked here.
+                    #[cfg(feature = "voip")]
+                    if is_offer {
+                        client
+                            .call_registry()
+                            .mark_incoming_ringing(call.action.call_id());
+                    }
                     // Caller-side: key our recv path to the device that actually answered. We dial the
                     // base callee LID, but a companion answers from `:N` and encrypts under its own
                     // device id; without this every inbound frame decrypts to garbage. One-shot, and a
@@ -82,29 +98,50 @@ impl StanzaHandler for CallHandler {
                     // rejects an outbound call of ours, tell the rest to stop ringing.
                     #[cfg(feature = "voip")]
                     dismiss_outgoing_siblings(&client, &call).await;
-                    // A peer <reject>/<terminate> ends the call: tear down the media task and any
-                    // dormant pending-outgoing entry so CallHandle::wait_ended() resolves, instead of
-                    // leaking the relay/mic task until an unrelated relay timeout. Runs after dismiss
-                    // (which reads the registry entry) and before the move into dispatch.
-                    // A <terminate> for a call with no active or pending registry entry is an
-                    // unanswered incoming call the peer gave up on: surface a missed call (WA Web's
-                    // "missed" call-log outcome) alongside the generic event.
+                    // A <terminate> for a call that was still ringing (an incoming offer we never
+                    // answered) gets a terminal outcome. We mirror WA Web's
+                    // ActionWebHandleIncomingSignalingMessage, which maps it from the `reason`:
+                    // timeout / group_call_ended / absent -> missed; accepted_elsewhere /
+                    // rejected_elsewhere -> answered/declined on another of our devices (NOT missed);
+                    // any other reason -> no outcome. take_ringing is one-shot and false for an
+                    // answered, outgoing, or already-terminated call, so we never misfire for our own
+                    // outgoing call or a duplicate terminate; it still consumes the flag on any reason.
+                    // Decided BEFORE terminate_call below.
                     #[cfg(feature = "voip")]
-                    if let CallAction::Terminate { .. } = &call.action
-                        && client
-                            .call_registry()
-                            .generation_of(call.action.call_id())
-                            .is_none()
+                    if let CallAction::Terminate { reason, .. } = &call.action
+                        && client.call_registry().take_ringing(call.action.call_id())
                     {
-                        client
-                            .core
-                            .event_bus
-                            .dispatch(Event::MissedCall(MissedCall::new(
-                                call.from.clone(),
-                                call.action.call_id().to_string(),
-                                call.timestamp,
-                                MissedReason::Remote,
-                            )));
+                        // Shared provenance for whichever outcome this reason maps to.
+                        let from = call.from.clone();
+                        let cid = call.action.call_id().to_string();
+                        let ts = call.timestamp;
+                        let outcome = match reason.as_deref() {
+                            None
+                            | Some(TERMINATE_REASON_TIMEOUT)
+                            | Some(TERMINATE_REASON_GROUP_CALL_ENDED) => Some(Event::MissedCall(
+                                MissedCall::new(from, cid, ts, MissedReason::Remote),
+                            )),
+                            Some(TERMINATE_REASON_ACCEPTED_ELSEWHERE) => {
+                                Some(Event::CallEndedElsewhere(CallEndedElsewhere::new(
+                                    from,
+                                    cid,
+                                    ts,
+                                    ElsewhereOutcome::Accepted,
+                                )))
+                            }
+                            Some(TERMINATE_REASON_REJECTED_ELSEWHERE) => {
+                                Some(Event::CallEndedElsewhere(CallEndedElsewhere::new(
+                                    from,
+                                    cid,
+                                    ts,
+                                    ElsewhereOutcome::Rejected,
+                                )))
+                            }
+                            _ => None,
+                        };
+                        if let Some(outcome) = outcome {
+                            client.core.event_bus.dispatch(outcome);
+                        }
                     }
                     #[cfg(feature = "voip")]
                     if matches!(
@@ -151,8 +188,8 @@ async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow:
 #[cfg(feature = "voip")]
 async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
     let reason = match &call.action {
-        CallAction::Accept { .. } => "accepted_elsewhere",
-        CallAction::Reject { .. } => "rejected_elsewhere",
+        CallAction::Accept { .. } => TERMINATE_REASON_ACCEPTED_ELSEWHERE,
+        CallAction::Reject { .. } => TERMINATE_REASON_REJECTED_ELSEWHERE,
         _ => return,
     };
     let call_id = call.action.call_id();
@@ -491,26 +528,69 @@ mod tests {
         );
     }
 
-    // A <terminate> for a call we never answered (no registry entry) surfaces a MissedCall(Remote),
-    // mirroring WA Web's missed-call outcome for an unanswered incoming call.
+    #[cfg(feature = "voip")]
+    fn terminate_stanza(from: Jid, call_creator: Jid, call_id: &str) -> wacore_binary::Node {
+        terminate_stanza_reason(from, call_creator, call_id, None)
+    }
+
+    #[cfg(feature = "voip")]
+    fn terminate_stanza_reason(
+        from: Jid,
+        call_creator: Jid,
+        call_id: &str,
+        reason: Option<&str>,
+    ) -> wacore_binary::Node {
+        let mut term = NodeBuilder::new("terminate")
+            .attr("call-creator", call_creator)
+            .attr("call-id", call_id);
+        if let Some(r) = reason {
+            term = term.attr("reason", r);
+        }
+        NodeBuilder::new("call")
+            .attr("from", from)
+            .attr("id", "STANZA-TERM")
+            .attr("t", "1766847151")
+            .children([term.build()])
+            .build()
+    }
+
+    #[cfg(feature = "voip")]
+    fn count_missed(rx: &async_channel::Receiver<Arc<Event>>, call_id: &str) -> usize {
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::MissedCall(m) = &*ev
+                && m.call_id == call_id
+                && matches!(m.reason, MissedReason::Remote)
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    // An incoming offer that rings and is never answered, then a peer <terminate>, surfaces exactly
+    // one MissedCall(Remote) -- WA Web's missed-call outcome. The offer is what marks the call ringing;
+    // a terminate with no preceding offer is an ended call, not a missed one.
     #[cfg(feature = "voip")]
     #[tokio::test]
-    async fn unanswered_terminate_surfaces_missed_call() {
+    async fn unanswered_incoming_terminate_surfaces_missed_call() {
         let client = make_client().await;
         let (handler, rx) = ChannelEventHandler::new();
         client.register_handler(handler);
 
-        let terminate = NodeBuilder::new("call")
-            .attr("from", fake_caller_lid())
-            .attr("id", "STANZA-TERM")
-            .attr("t", "1766847151")
-            .children([NodeBuilder::new("terminate")
-                .attr("call-creator", fake_caller_lid())
-                .attr("call-id", "CALL-ID-0001")
-                .build()])
-            .build();
-
         let mut cancelled = false;
+        // The offer rings (marks the call ringing).
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&offer_stanza()),
+                    &mut cancelled
+                )
+                .await
+        );
+        // The peer gives up before we answer.
+        let terminate = terminate_stanza(fake_caller_lid(), fake_caller_lid(), "CALL-ID-0001");
         assert!(
             CallHandler
                 .handle(
@@ -520,19 +600,194 @@ mod tests {
                 )
                 .await
         );
+        assert_eq!(
+            count_missed(&rx, "CALL-ID-0001"),
+            1,
+            "an unanswered incoming <terminate> must surface exactly one MissedCall(Remote)"
+        );
+    }
 
-        let mut seen = false;
-        while let Ok(ev) = rx.try_recv() {
-            if let Event::MissedCall(m) = &*ev
-                && m.call_id == "CALL-ID-0001"
-                && matches!(m.reason, MissedReason::Remote)
-            {
-                seen = true;
-            }
-        }
+    // A duplicate <terminate> for the same unanswered call must NOT re-fire a missed call: the ringing
+    // flag is consumed one-shot by the first terminate.
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn duplicate_terminate_does_not_refire_missed_call() {
+        let client = make_client().await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.register_handler(handler);
+
+        let mut cancelled = false;
         assert!(
-            seen,
-            "an unanswered <terminate> must surface a MissedCall(Remote)"
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&offer_stanza()),
+                    &mut cancelled
+                )
+                .await
+        );
+        let terminate = terminate_stanza(fake_caller_lid(), fake_caller_lid(), "CALL-ID-0001");
+        for _ in 0..2 {
+            assert!(
+                CallHandler
+                    .handle(
+                        client.clone(),
+                        node_to_owned_ref(&terminate),
+                        &mut cancelled
+                    )
+                    .await
+            );
+        }
+        assert_eq!(
+            count_missed(&rx, "CALL-ID-0001"),
+            1,
+            "a duplicate <terminate> must not surface a second MissedCall"
+        );
+    }
+
+    // A <terminate> for an OUTGOING call we placed must NOT surface a missed call: we never rang for
+    // it, so it is an ended call, not a missed one. This is the regression the registry-absence gate
+    // produced -- our own call's teardown looked identical to an unanswered incoming call.
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn outgoing_call_terminate_does_not_surface_missed_call() {
+        let client = make_client().await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.register_handler(handler);
+
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let creator = Jid::new("111111111111111", Server::Lid); // us, the caller
+        client
+            .call_registry()
+            .insert(wacore::voip::CallSession::new_outgoing(
+                "CALL-ID-OUT",
+                peer.clone(),
+                creator.clone(),
+            ));
+
+        let mut cancelled = false;
+        // The peer terminates our outgoing call; even a second terminate must stay silent.
+        let terminate = terminate_stanza(peer.with_device(1), creator, "CALL-ID-OUT");
+        for _ in 0..2 {
+            assert!(
+                CallHandler
+                    .handle(
+                        client.clone(),
+                        node_to_owned_ref(&terminate),
+                        &mut cancelled
+                    )
+                    .await
+            );
+        }
+        assert_eq!(
+            count_missed(&rx, "CALL-ID-OUT"),
+            0,
+            "an outgoing call's <terminate> must never surface a MissedCall(Remote)"
+        );
+    }
+
+    // WA Web (ActionWebHandleIncomingSignalingMessage) maps a <terminate reason=...> to a call-log
+    // outcome: accepted_elsewhere -> AcceptedElsewhere and rejected_elsewhere -> Rejected, meaning
+    // another of our devices took the call. A companion device that rang then receives the caller's
+    // elsewhere-dismiss must surface CallEndedElsewhere with the matching outcome, NOT a MissedCall.
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn elsewhere_terminate_surfaces_call_ended_elsewhere_not_missed() {
+        for (reason, expected) in [
+            ("accepted_elsewhere", ElsewhereOutcome::Accepted),
+            ("rejected_elsewhere", ElsewhereOutcome::Rejected),
+        ] {
+            let client = make_client().await;
+            let (handler, rx) = ChannelEventHandler::new();
+            client.register_handler(handler);
+
+            let mut cancelled = false;
+            assert!(
+                CallHandler
+                    .handle(
+                        client.clone(),
+                        node_to_owned_ref(&offer_stanza()),
+                        &mut cancelled
+                    )
+                    .await
+            );
+            let terminate = terminate_stanza_reason(
+                fake_caller_lid(),
+                fake_caller_lid(),
+                "CALL-ID-0001",
+                Some(reason),
+            );
+            assert!(
+                CallHandler
+                    .handle(
+                        client.clone(),
+                        node_to_owned_ref(&terminate),
+                        &mut cancelled
+                    )
+                    .await
+            );
+            // Single drain: assert the elsewhere outcome is present and no MissedCall slipped through.
+            let mut missed = 0;
+            let mut elsewhere = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                match &*ev {
+                    Event::MissedCall(m) if m.call_id == "CALL-ID-0001" => missed += 1,
+                    Event::CallEndedElsewhere(e) if e.call_id == "CALL-ID-0001" => {
+                        elsewhere.push(e.outcome)
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                missed, 0,
+                "a <terminate reason=\"{reason}\"> must not surface a MissedCall"
+            );
+            assert_eq!(
+                elsewhere,
+                vec![expected],
+                "a <terminate reason=\"{reason}\"> must surface CallEndedElsewhere({expected:?})"
+            );
+        }
+    }
+
+    // A reason that IS a missed outcome (timeout) on a still-ringing call surfaces the missed call,
+    // confirming the reason gate excludes only the elsewhere outcomes, not every reason.
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn timeout_terminate_surfaces_missed_call() {
+        let client = make_client().await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.register_handler(handler);
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&offer_stanza()),
+                    &mut cancelled
+                )
+                .await
+        );
+        let terminate = terminate_stanza_reason(
+            fake_caller_lid(),
+            fake_caller_lid(),
+            "CALL-ID-0001",
+            Some("timeout"),
+        );
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&terminate),
+                    &mut cancelled
+                )
+                .await
+        );
+        assert_eq!(
+            count_missed(&rx, "CALL-ID-0001"),
+            1,
+            "a <terminate reason=\"timeout\"> on a ringing call must surface a MissedCall"
         );
     }
 }

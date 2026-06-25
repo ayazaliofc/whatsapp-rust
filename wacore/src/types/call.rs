@@ -111,6 +111,11 @@ pub enum CallAction {
     Terminate {
         call_id: String,
         call_creator: Jid,
+        /// Why the peer ended the call. WA Web maps this to the call-log outcome:
+        /// `accepted_elsewhere`/`rejected_elsewhere` mean another of the callee's devices
+        /// answered/declined (NOT a missed call); `timeout`/`group_call_ended`/absent mean missed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         duration: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,6 +243,50 @@ pub enum MissedReason {
     /// A `<terminate>` arrived for an incoming call we never answered (the peer gave up). Mirrors WA
     /// Web's "missed" call-log outcome for an unanswered call.
     Remote,
+}
+
+/// An incoming call we were ringing for was resolved on ANOTHER of our devices (multi-device): the
+/// caller dismissed this device with a `<terminate reason="accepted_elsewhere"|"rejected_elsewhere">`.
+/// Distinct from [`MissedCall`] (a genuinely unanswered call) so a consumer can render "answered on
+/// another device" instead of a missed call. Mirrors WA Web's AcceptedElsewhere / Rejected outcomes.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct CallEndedElsewhere {
+    pub from: Jid,
+    /// The call id (from the `<offer>` action); distinct from the `<call>` stanza id.
+    pub call_id: String,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub timestamp: DateTime<Utc>,
+    pub outcome: ElsewhereOutcome,
+}
+
+impl CallEndedElsewhere {
+    /// `#[non_exhaustive]` blocks the struct literal cross-crate, so the high-level crate builds one
+    /// here.
+    pub fn new(
+        from: Jid,
+        call_id: String,
+        timestamp: DateTime<Utc>,
+        outcome: ElsewhereOutcome,
+    ) -> Self {
+        Self {
+            from,
+            call_id,
+            timestamp,
+            outcome,
+        }
+    }
+}
+
+/// Which terminal outcome another of our devices reached for a call we were ringing for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ElsewhereOutcome {
+    /// Another of our devices answered the call (`reason="accepted_elsewhere"`).
+    Accepted,
+    /// Another of our devices declined the call (`reason="rejected_elsewhere"`).
+    Rejected,
 }
 
 impl IncomingCall {

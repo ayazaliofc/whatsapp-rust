@@ -7,7 +7,7 @@
 //! drives the Tokio driver task, a wasm `spawn_local` task, or any other runtime without coupling
 //! the portable core to a specific executor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
@@ -33,6 +33,11 @@ struct CallEntry {
 pub struct CallRegistry {
     inner: Mutex<HashMap<String, CallEntry>>,
     next_gen: AtomicU64,
+    /// Incoming offers we've rung but not yet answered, keyed by call-id. Mirrors WA Web's
+    /// `_ringingCalls`: it is the ONLY signal that distinguishes a genuine missed call (a `<terminate>`
+    /// for an offer still ringing) from a `<terminate>` for an answered or outgoing call. Active-call
+    /// absence cannot tell them apart, since an answered call leaves the map on teardown too.
+    ringing: Mutex<HashSet<String>>,
 }
 
 impl CallRegistry {
@@ -47,6 +52,10 @@ impl CallRegistry {
     /// OWN entry, never a newer replacement.
     pub fn insert(&self, session: CallSession) -> u64 {
         let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        // Registering a call as active answers (accept) or places (outgoing) it: it is no longer
+        // merely ringing. A no-op for an outgoing call (never ringing); for an accepted incoming
+        // offer this clears the ringing flag so a later `<terminate>` reads as ended, not missed.
+        self.take_ringing(&session.call_id);
         let mut map = self.inner.lock().expect("registry lock poisoned");
         let prev = map.insert(
             session.call_id.clone(),
@@ -177,6 +186,28 @@ impl CallRegistry {
         self.inner.lock().expect("registry lock poisoned").len()
     }
 
+    /// Record an incoming offer as ringing (not yet answered) so a later `<terminate>` for it can be
+    /// surfaced as a missed call. Idempotent; the flag is consumed by [`take_ringing`](Self::take_ringing)
+    /// on answer or terminate. Do not call for an offline-queued offer: that one is already surfaced
+    /// as missed-offline and must not double-fire.
+    pub fn mark_incoming_ringing(&self, call_id: &str) {
+        self.ringing
+            .lock()
+            .expect("registry lock poisoned")
+            .insert(call_id.to_string());
+    }
+
+    /// Consume the ringing flag for `call_id`, returning whether it was still ringing. True means a
+    /// genuine missed call (an unanswered incoming offer the peer gave up on); false means the call
+    /// was answered, was outgoing, or was already resolved (so a duplicate `<terminate>` is ended,
+    /// never a second missed). One-shot.
+    pub fn take_ringing(&self, call_id: &str) -> bool {
+        self.ringing
+            .lock()
+            .expect("registry lock poisoned")
+            .remove(call_id)
+    }
+
     /// Remove a call, aborting its media task. Returns true if it existed.
     pub fn remove(&self, call_id: &str) -> bool {
         match self
@@ -218,6 +249,7 @@ impl CallRegistry {
     /// Abort every call's media task and clear the registry. Returns the number cleared.
     /// Call this from your own disconnect/reconnect teardown; it is not wired into the client.
     pub fn abort_all(&self) -> usize {
+        self.ringing.lock().expect("registry lock poisoned").clear();
         let mut map = self.inner.lock().expect("registry lock poisoned");
         for entry in map.values() {
             if let Some(task) = &entry.media_task {
@@ -270,6 +302,44 @@ mod tests {
         assert_eq!(rx.try_recv().ok().as_deref(), Some("222222222222222:2@lid"));
         reg.send_rekey("CID", "again".into());
         assert!(rx.try_recv().is_err(), "rekey sender is one-shot");
+    }
+
+    #[test]
+    fn ringing_is_one_shot_and_distinguishes_missed_from_ended() {
+        let reg = CallRegistry::new();
+        // An unanswered incoming offer: marked ringing, then a <terminate> consumes it as missed.
+        reg.mark_incoming_ringing("RING");
+        assert!(reg.take_ringing("RING"), "an unanswered offer is missed");
+        assert!(
+            !reg.take_ringing("RING"),
+            "one-shot: a duplicate <terminate> is ended, not a second missed"
+        );
+        // A call we never rang (outgoing, or a terminate with no preceding offer) is never missed.
+        assert!(!reg.take_ringing("NEVER"));
+    }
+
+    #[test]
+    fn answering_an_incoming_offer_clears_its_ringing_flag() {
+        let reg = CallRegistry::new();
+        reg.mark_incoming_ringing("CID");
+        // Accepting the call registers it as active (insert), which clears the ringing flag so a
+        // later <terminate> reads as ended, not missed.
+        let _g = reg.insert(session("CID"));
+        assert!(
+            !reg.take_ringing("CID"),
+            "an answered call must not surface a missed call on terminate"
+        );
+    }
+
+    #[test]
+    fn abort_all_clears_ringing() {
+        let reg = CallRegistry::new();
+        reg.mark_incoming_ringing("CID");
+        reg.abort_all();
+        assert!(
+            !reg.take_ringing("CID"),
+            "a disconnect must drop stale ringing state so it can't surface after reconnect"
+        );
     }
 
     #[test]
