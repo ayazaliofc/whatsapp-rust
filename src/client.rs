@@ -12,6 +12,8 @@ mod node_io;
 pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
+mod voip;
+pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;
 use crate::cache_store::TypedCache;
@@ -647,6 +649,21 @@ pub struct Client {
     /// When true, emit `Event::RawNode` for every decoded stanza before router dispatch.
     /// Default false — only enable when external consumers need raw protocol access.
     raw_node_forwarding: AtomicBool,
+
+    /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
+    /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the
+    /// `voip` feature: it is populated only by the `voip` media facade.
+    #[cfg(feature = "voip")]
+    pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
+
+    /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
+    /// from the server AFTER the offer (live-only), so each `voip().call()` parks the material needed
+    /// to spawn the engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id
+    /// arrives. Behind the `voip` feature; populated only by the media facade.
+    #[cfg(feature = "voip")]
+    pub(crate) pending_outgoing_calls: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::voip::facade::PendingOutgoing>>,
+    >,
 }
 
 /// Builds a pong response node for a server-initiated ping.
