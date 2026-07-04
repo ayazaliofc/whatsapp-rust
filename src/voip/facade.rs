@@ -535,7 +535,7 @@ async fn place_call(
     // Register the ack-waiter for the offer's stanza id BEFORE send_node so a fast server reply can't
     // arrive before we are listening. The ack carries the relay; the spawned task below attaches the
     // engine when it resolves.
-    let ack_rx = client.register_ack_waiter(&offer_stanza_id).await;
+    let ack_rx = client.register_ack_waiter(&offer_stanza_id);
 
     // Register the outgoing call AND park the relay-attach material BEFORE send_node, mirroring the
     // incoming register-before-connect ordering. The handle starts dormant; the ack-waiter task
@@ -599,11 +599,7 @@ async fn place_call(
         let removed = take_pending_if_current(&client.pending_outgoing_calls, &call_id, generation);
         registry.remove_if_current(&call_id, generation);
         // No ack will ever arrive for the failed offer; drop the waiter so it can't leak.
-        client
-            .response_waiters
-            .lock()
-            .await
-            .remove(&offer_stanza_id);
+        client.response_waiters_guard().remove(&offer_stanza_id);
         if removed.is_some() {
             ended.notify();
         }
@@ -676,11 +672,7 @@ fn spawn_outgoing_relay_waiter(
                     // handle_ack_response never ran, so our still-registered waiter entry must be dropped
                     // here or send_keepalive suppresses pings for the life of the connection.
                     Ok(Err(_)) | Err(_) => {
-                        client
-                            .response_waiters
-                            .lock()
-                            .await
-                            .remove(&offer_stanza_id);
+                        client.response_waiters_guard().remove(&offer_stanza_id);
                         None
                     }
                 };
@@ -2726,19 +2718,17 @@ mod tests {
         let client = make_client().await;
 
         let offer_stanza_id = "OFFER-STANZA-J".to_string();
-        let ack_rx = client.register_ack_waiter(&offer_stanza_id).await;
+        let ack_rx = client.register_ack_waiter(&offer_stanza_id);
         assert!(
             client
-                .response_waiters
-                .lock()
-                .await
+                .response_waiters_guard()
                 .contains_key(&offer_stanza_id),
             "the ack-waiter must be registered"
         );
         // Drop the sender (re-register a NEW waiter under the same id) so ack_rx closes immediately and
         // the task takes the no-ack closed-channel branch without waiting out the full timeout. The new
         // waiter is what the cleanup must then remove.
-        let _shadow_rx = client.register_ack_waiter(&offer_stanza_id).await;
+        let _shadow_rx = client.register_ack_waiter(&offer_stanza_id);
 
         // No matching pending entry: the task's attach is a harmless no-op, but the response_waiters
         // cleanup must still run.
@@ -2753,9 +2743,7 @@ mod tests {
         // The spawned task drops the now-dangling waiter on the no-ack path.
         for _ in 0..200 {
             if !client
-                .response_waiters
-                .lock()
-                .await
+                .response_waiters_guard()
                 .contains_key(&offer_stanza_id)
             {
                 break;
@@ -2764,9 +2752,7 @@ mod tests {
         }
         assert!(
             !client
-                .response_waiters
-                .lock()
-                .await
+                .response_waiters_guard()
                 .contains_key(&offer_stanza_id),
             "a no-ack relay-waiter must drop its response_waiters entry so keepalive isn't suppressed"
         );

@@ -77,7 +77,7 @@ impl Client {
 
         // WA Web: skip ping if there are pending IQs
         // (`activePing || ackHandlers.length || pendingIqs.size`)
-        let has_pending = !self.response_waiters.lock().await.is_empty();
+        let has_pending = !self.response_waiters_guard().is_empty();
         if has_pending {
             debug!(target: "Client/Keepalive", "Skipping ping: IQ responses pending");
             return KeepaliveResult::Ok;
