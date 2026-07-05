@@ -924,33 +924,23 @@ impl Client {
                     "Starting Initial App State Sync (flag_set={flag_set}, needs_pushname={needs_pushname_from_sync})"
                 );
 
-                if !client_clone
-                    .initial_app_state_keys_received
-                    .load(Ordering::Relaxed)
-                {
-                    debug!(
-                        target: "Client/AppState",
-                        "Waiting up to 5s for app state keys..."
-                    );
-                    let _ = rt_timeout(
-                        &*client_clone.runtime,
-                        Duration::from_secs(5),
-                        client_clone.initial_keys_synced_notifier.listen(),
-                    )
-                    .await;
-
-                    // Check if connection was replaced while waiting
-                    check_generation!();
-                }
-
-                // Start the critical sync timeout timer matching WhatsApp Web's
-                // WAWebSyncBootstrap.$15 (setSyncDCriticalDataSyncTimeout).
-                // WhatsApp Web uses 180s and calls socketLogout(SyncdTimeout) if
-                // the critical data hasn't synced by then.
+                // Single deadline for the whole critical path (key-share grace + batched
+                // IQ + missing-key fallback). Matches WhatsApp Web's WAWebSyncBootstrap
+                // 180s critical-data deadline. Armed before the wait so every step below
+                // is bounded by the same clock.
                 const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
+                let critical_deadline = wacore::time::Instant::now()
+                    + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
+                // Explicit "critical sync completed" signal for the watchdog. A push_name
+                // check is not a reliable proxy: a business account gets push_name set
+                // from business_name at pairing (src/pair.rs) while still needing the
+                // full sync, so the watchdog would wrongly stand down on a failed sync.
+                let critical_sync_done =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let timeout_client = client_clone.clone();
                 let timeout_generation = task_generation;
                 let timeout_rt = client_clone.runtime.clone();
+                let timeout_done = critical_sync_done.clone();
                 let critical_sync_timeout_handle = timeout_rt.spawn(Box::pin(async move {
                     timeout_client.runtime.sleep(Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS)).await;
                     // Check generation — if connection was replaced, this timeout is stale
@@ -959,38 +949,68 @@ impl Client {
                     {
                         return;
                     }
-                    // Matches WhatsApp Web's $16(): check if SettingPushName was synced.
-                    // If push_name is still empty after 180s, critical sync failed.
-                    let push_name = timeout_client.get_push_name();
-                    if push_name.is_empty() {
+                    if timeout_done.load(Ordering::SeqCst) {
+                        debug!(
+                            target: "Client/AppState",
+                            "Critical sync timeout fired but critical sync already completed"
+                        );
+                    } else {
                         warn!(
                             target: "Client/AppState",
-                            "Critical app state sync timed out after {CRITICAL_SYNC_TIMEOUT_SECS}s \
-                             (push_name not synced). Reconnecting to retry."
+                            "Critical app state sync did not complete within {CRITICAL_SYNC_TIMEOUT_SECS}s. \
+                             Reconnecting to retry."
                         );
                         // WhatsApp Web does socketLogout here which clears device identity.
                         // We reconnect instead — preserving credentials and keeping the
                         // run loop active so auto-reconnect can retry the sync.
                         timeout_client.reconnect_immediately().await;
-                    } else {
-                        debug!(
-                            target: "Client/AppState",
-                            "Critical sync timeout fired but push_name was already synced"
-                        );
                     }
                 }));
 
+                // Brief grace for the auto-shared key that the primary sends at pairing
+                // (the WA Web primary path). The listener is registered before the flag
+                // check because the notifier is not sticky — a key-share landing in the
+                // load→listen gap would otherwise be missed. This wait is only an
+                // optimization to avoid a redundant explicit key request in the common
+                // fast case; if the key is late (heavy history sync) or never
+                // auto-shared, the batched sync below falls back to an explicit
+                // AppStateSyncKeyRequest bounded by `critical_deadline`, so correctness
+                // does not depend on this grace.
+                const KEY_SHARE_GRACE_SECS: u64 = 10;
+                let key_share_listener = client_clone.initial_keys_synced_notifier.listen();
+                if !client_clone
+                    .initial_app_state_keys_received
+                    .load(Ordering::Relaxed)
+                {
+                    debug!(
+                        target: "Client/AppState",
+                        "Waiting up to {KEY_SHARE_GRACE_SECS}s for the auto-shared app state key..."
+                    );
+                    let _ = rt_timeout(
+                        &*client_clone.runtime,
+                        Duration::from_secs(KEY_SHARE_GRACE_SECS),
+                        key_share_listener,
+                    )
+                    .await;
+
+                    // Check if connection was replaced while waiting
+                    check_generation!();
+                }
+
                 // Await critical collections via batched IQ before dispatching Connected.
+                // The deadline lets the missing-key fallback recover a late/never-shared
+                // key on this connection instead of stalling to the watchdog.
                 check_generation!();
                 match client_clone
-                    .sync_collections_batched(vec![
-                        WAPatchName::CriticalBlock,
-                        WAPatchName::CriticalUnblockLow,
-                    ])
+                    .sync_collections_batched(
+                        vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+                        Some(critical_deadline),
+                    )
                     .await
                 {
                     Ok(()) => {
-                        // Critical sync completed — cancel the timeout timer
+                        // Critical sync completed — signal the watchdog, then cancel it.
+                        critical_sync_done.store(true, Ordering::SeqCst);
                         critical_sync_timeout_handle.abort();
 
                         check_generation!();
@@ -1009,9 +1029,12 @@ impl Client {
                     }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
-                        // Don't abort the timeout or dispatch Connected — the sync failed,
-                        // so the timeout watchdog should remain active to force a reconnect
-                        // if needed. Return early to avoid emitting a spurious Connected event.
+                        // The sync failed — the watchdog must stay alive to force a reconnect.
+                        // detach() so this early return doesn't abort it on drop (AbortHandle
+                        // aborts the task when dropped); without this the watchdog would be
+                        // cancelled exactly when the deadline-bound wait fails, and no
+                        // reconnect would happen.
+                        critical_sync_timeout_handle.detach();
                         return;
                     }
                 }
@@ -1026,11 +1049,14 @@ impl Client {
                     }
 
                     if let Err(e) = sync_client
-                        .sync_collections_batched(vec![
-                            WAPatchName::RegularLow,
-                            WAPatchName::RegularHigh,
-                            WAPatchName::Regular,
-                        ])
+                        .sync_collections_batched(
+                            vec![
+                                WAPatchName::RegularLow,
+                                WAPatchName::RegularHigh,
+                                WAPatchName::Regular,
+                            ],
+                            None,
+                        )
                         .await
                     {
                         sync_client.log_sync_error("non-critical app state sync", &e);
