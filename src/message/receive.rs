@@ -1286,6 +1286,22 @@ impl Client {
                         continue;
                     }
 
+                    // Recoverable sender-key desync: retry receipt (prompts an SKDM
+                    // resend), not a 500 NACK that would drop the message permanently.
+                    if let Some(reason) = group_decrypt_retry_reason(&e) {
+                        log::log!(
+                            decrypt_fail_log_level(decrypt_fail_mode),
+                            "Group batch decrypt failed [msg:{}] for group {} sender {}: {:?}. Sending retry receipt.",
+                            info.id,
+                            sender_key_name.group_id(),
+                            sender_key_name.sender_id(),
+                            e
+                        );
+                        self.handle_decrypt_failure(info, reason, decrypt_fail_mode)
+                            .await;
+                        continue;
+                    }
+
                     log::log!(
                         decrypt_fail_log_level(decrypt_fail_mode),
                         "Group batch decrypt failed [msg:{}] for group {} sender {}: {:?}",
